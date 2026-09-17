@@ -65,7 +65,10 @@ int main(int argc,char** argv){
   float al=powf(2.f*L,-0.25f), fac=1.f/sqrtf((float)hd);
   dim3 gh_(R,(d+255)/256), gh2(R,(dff+255)/256), th(B,64,H);
 
+  cudaEvent_t ea,eb,ec; cudaEventCreate(&ea);cudaEventCreate(&eb);cudaEventCreate(&ec);
+  float t_attn=0,t_ffn=0;
   auto layer=[&](half_t* xin,half_t* xout){
+    cudaEventRecord(ea);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,qw,d,xin,d,0.f,qd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,kw,d,xin,d,0.f,kd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,vw,d,xin,d,0.f,vd,d);
@@ -77,6 +80,7 @@ int main(int argc,char** argv){
     k_fromheads<<<th,hd>>>(po,ctx,H,hd);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,ow,d,po,d,0.f,attn,d);
     LayerNorm<half_t>(R,d,xa,attn,zb,xin,l1,zb,1e-3f,al,ACTIVATION_NONE,0);
+    cudaEventRecord(eb);
     // FFN: gather by expert -> per-expert gemm up/mish/down -> scatter
     k_gather<<<gh_,256>>>(xs,xa,dOrder,d);
     for(int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
@@ -85,6 +89,8 @@ int main(int argc,char** argv){
       gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,dnw+(size_t)e*d*dff,dff,gh+(size_t)off[e]*dff,dff,0.f,ys+(size_t)off[e]*d,d); }
     k_scatter<<<gh_,256>>>(ffn,ys,dOrder,d);
     LayerNorm<half_t>(R,d,xout,ffn,zb,xa,l2,zb,1e-3f,al,ACTIVATION_NONE,0);
+    cudaEventRecord(ec); cudaEventSynchronize(ec);
+    float a1,a2; cudaEventElapsedTime(&a1,ea,eb); cudaEventElapsedTime(&a2,eb,ec); t_attn+=a1; t_ffn+=a2;
   };
   auto fwd=[&](){ half_t* a=x; half_t* b=xn; for(int i=0;i<L;i++){ layer(a,b); half_t* t=a;a=b;b=t; } };
 
@@ -95,7 +101,8 @@ int main(int argc,char** argv){
   float ms; cudaEventElapsedTime(&ms,s0,s1); double per=ms/IT/1000.0;
   double gflop=13.2; // trunk-only ~ per-pos GFLOP (approx; heads are ~1%)
   double posps=B/per, mfu=gflop*1e9*posps/peak;
-  printf("HERO TRUNK bench: dev=%s B=%d  %.2f ms/fwd  %.0f pos/s  MFU~%.3f (peak %.0f TF)\n",
-         name,B,per*1000,posps,mfu,peak/1e12);
+  double tot=t_attn+t_ffn;
+  printf("HERO TRUNK bench: dev=%s B=%d  %.2f ms/fwd  %.0f pos/s  MFU~%.3f (peak %.0f TF)  [attn %.0f%% ffn %.0f%%]\n",
+         name,B,per*1000,posps,mfu,peak/1e12, 100*t_attn/tot, 100*t_ffn/tot);
   printf("BENCH_DONE\n"); return 0;
 }
