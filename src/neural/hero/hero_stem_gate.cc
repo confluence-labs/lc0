@@ -25,6 +25,13 @@ using namespace lczero;
 using namespace lczero::cudnn_backend;
 using half_t = half;
 
+// stub the one layers.cc symbol common_kernels needs (avoids compiling layers.cc)
+namespace lczero { namespace cudnn_backend {
+void CudaError(cudaError_t s, const char* f, const int& l) {
+  if (s != cudaSuccess) { fprintf(stderr, "CUDA error %s (%s:%d)\n", cudaGetErrorString(s), f, l); exit(1); }
+}
+}}
+
 #define CK(x) do { cudaError_t e=(x); if(e){printf("CUDA %s @ %d: %s\n",#x,__LINE__,cudaGetErrorString(e));exit(1);} } while(0)
 #define CB(x) do { cublasStatus_t s=(x); if(s){printf("CUBLAS %s @ %d: %d\n",#x,__LINE__,(int)s);exit(1);} } while(0)
 
