@@ -10,6 +10,16 @@ vs ~13.8k BT4 vs ~23k roofline on A100): `confluence-labs/hero-inference`
 
 All file:line refs are this tree (upstream clone, `src/neural/`).
 
+## PERF FINDING (2026-09-17): attention is the bottleneck, NOT the FFN
+
+Device-resident trunk bench on A100 (naive attn + per-expert cuBLAS FFN loop):
+~5.3k pos/s, 22% MFU — but split timing shows **attn 76-98%, FFN ~20%**. The
+routed expert FFN (the novel part) is CHEAP; the bottleneck is the STANDARD
+attention (my naive transposes + 32k tiny 64x64 batched gemms). Fix = reuse
+lc0's `fusedMHA` (flash-style, CUTLASS-gated). PRIORITY 1 = fused attention
+(the ~80%), PRIORITY 2 = CUTLASS grouped FFN (the ~20%). Both need a
+meson build with `-Dcutlass=true`, so pivot from standalone nvcc to meson.
+
 ## Target hardware: A100 (CCC parity) — Ampere SM80
 
 Decision 2026-09-17 (user): optimize for **CCC parity = 2x A100-40GB (Ampere,
