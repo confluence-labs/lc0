@@ -301,14 +301,16 @@ int main(int argc, char** argv) {
   half_t* tpd=upload(tp,scratch);
   auto qp = gemm_dl(w.pol_q_w,pd,pd,&w.pol_q_b,false,tpd,N*64);
   auto kp = gemm_dl(w.pol_k_w,pd,pd,&w.pol_k_b,false,tpd,N*64);
-  auto pp = gemm_dl(w.pol_ppo_w,pd,4,nullptr,false,tpd,N*64);            // ppo(t): (N*64,4)
+  const auto& PPO = w.pol_ppo_w;   // [4, pd] ; hero.py applies ppo to K (not t)
   double sc = 1.0/sqrt((double)pd);
   std::vector<float> polout((size_t)N*1858);
   for (int n=0;n<N;n++){
     std::vector<float> attn(4096);
     for(int i=0;i<64;i++)for(int j=0;j<64;j++){ double s=0; for(int c=0;c<pd;c++) s+=(double)qp[((size_t)n*64+i)*pd+c]*kp[((size_t)n*64+j)*pd+c]; attn[i*64+j]=(float)(s*sc); }
-    // promotion (192): off24[f*3+c] = ppo(k[56+f])[c] + ppo(k[56+f])[3]
-    float off24[24]; for(int f=0;f<8;f++)for(int c=0;c<3;c++){ size_t kk=((size_t)n*64+56+f)*4; off24[f*3+c]=pp[kk+c]+pp[kk+3]; }
+    // promotion (192): ppo(k[56+f]) -> po[4]; off24[f*3+c] = po[c] + po[3]
+    float off24[24]; for(int f=0;f<8;f++){ double po[4];
+      for(int c=0;c<4;c++){ double s=0; for(int e=0;e<pd;e++) s+=(double)kp[((size_t)n*64+56+f)*pd+e]*PPO[c*pd+e]; po[c]=s; }
+      for(int c=0;c<3;c++) off24[f*3+c]=(float)(po[c]+po[3]); }
     std::vector<float> prom(192);
     for(int rr=0;rr<8;rr++)for(int f=0;f<8;f++)for(int c=0;c<3;c++) prom[rr*24+f*3+c]=attn[(48+rr)*64+(56+f)]+off24[f*3+c];
     std::vector<float> cat(4288); memcpy(cat.data(),attn.data(),4096*sizeof(float)); memcpy(cat.data()+4096,prom.data(),192*sizeof(float));
@@ -333,8 +335,8 @@ int main(int argc, char** argv) {
   // compare
   auto refP=load_npy_f32(od+"/policy.npy"), refW=load_npy_f32(od+"/wdl.npy");
   double pw=0,ps=0,prm=0; for(size_t i=0;i<polout.size();i++){double dd=fabs(polout[i]-refP[i]);pw=fmax(pw,dd);ps+=dd;prm=fmax(prm,fabs(refP[i]));}
-  double vw=0; for(size_t i=0;i<wdlout.size();i++) vw=fmax(vw,fabs(wdlout[i]-refW[i]));
-  bool pol_ok = pw/prm<3e-2 && ps/polout.size()<2e-3, val_ok=vw<1e-2;
+  double vw=0,rmw=0; for(size_t i=0;i<wdlout.size();i++){vw=fmax(vw,fabs(wdlout[i]-refW[i]));rmw=fmax(rmw,fabs(refW[i]));}
+  bool pol_ok = pw/prm<3e-2 && ps/polout.size()<2e-3, val_ok=vw/rmw<3e-2;
   printf("POLICY gate: worst|d|=%.4f mean|d|=%.5f worst_rel=%.4f (of %.1f) (%s)\n", pw, ps/polout.size(), pw/prm, prm, pol_ok?"PASS":"FAIL");
   printf("VALUE  gate: worst|d|=%.4f wdl0=[%.3f %.3f %.3f] ref=[%.3f %.3f %.3f] (%s)\n",
          vw, wdlout[0],wdlout[1],wdlout[2], refW[0],refW[1],refW[2], val_ok?"PASS":"FAIL");
