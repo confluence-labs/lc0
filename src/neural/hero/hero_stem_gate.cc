@@ -39,8 +39,11 @@ void CudaError(cudaError_t s, const char* f, const int& l) {
 static void gemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,
                  int m, int n, int k, float alpha, const half_t* A, int lda,
                  const half_t* B, int ldb, float beta, half_t* C, int ldc) {
-  __half al = __float2half(alpha), be = __float2half(beta);
-  CB(cublasHgemm(h, ta, tb, m, n, k, &al, A, lda, B, ldb, &be, C, ldc));
+  // fp16 operands, fp32 accumulate (as lc0's cublasXgemm) — Hgemm's fp16
+  // accumulate overflows to inf on 768-term dots.
+  CB(cublasGemmEx(h, ta, tb, m, n, k, &alpha, A, CUDA_R_16F, lda,
+                  B, CUDA_R_16F, ldb, &beta, C, CUDA_R_16F, ldc,
+                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 static half_t* upload(const std::vector<float>& v, void* scratch) {
   if (v.empty()) return nullptr;
