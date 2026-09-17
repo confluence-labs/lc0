@@ -10,6 +10,16 @@ vs ~13.8k BT4 vs ~23k roofline on A100): `confluence-labs/hero-inference`
 
 All file:line refs are this tree (upstream clone, `src/neural/`).
 
+## Target hardware: A100 (CCC parity) — Ampere SM80
+
+Decision 2026-09-17 (user): optimize for **CCC parity = 2x A100-40GB (Ampere,
+SM80)**. Beat BT4's 13.8k nps baseline on an A100. IMPLICATION for INC4: the
+CUTLASS **kGrouped** MoE kernel is Hopper (SM90)-only, NOT available on Ampere.
+On A100 the expert-FFN options are (a) CUTLASS 2.x grouped GEMM (SM80), (b) a
+per-expert cuBLAS-loop (already validated for correctness), or (c) a batched
+GEMM. Bench all three on A100; pick by nps at lc0 leaf batch. Correctness work
+is hardware-independent (fp16); nps benches run on A100, not L4.
+
 ## The 6 changes
 
 1. **FFN swap** — `backends/cuda/layers.cc:2053-2073`. The dense FFN is two
