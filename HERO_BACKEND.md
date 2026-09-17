@@ -65,6 +65,32 @@ Reference `.htw` + oracle (planes/policy/wdl npy) in GCS `hero/`.
   (`src/neural/hero/network_hero.cc`; sniff in `loader.cc:LoadWeights`; path
   injected in `wrapper.cc`). `--backend=hero --weights=x.htw` loads the net
   through the real lc0 binary ("Hero net loaded: d=1024 ..."), forward stubs.
+### INC3 blueprint (fork lc0's CudaNetwork — near-identical, 3 deltas)
+
+`CudaNetwork` = a `vector<BaseLayer>` each with
+`Eval(N, out, in, in2, scratch, ..., cublas, stream, ...)`; forward rotates
+`tensor_mem[0..2]` + `scratch_mem`. Fork it as `HeroCudaNetwork` with a shorter
+list (no conv/residual, no MLH). Feed layers from `HeroWeights` via the same
+`allocAndUpload` (fp32->fp16 on GPU).
+
+- **Stem** = lc0's `is_pe_dense_embedding_` path, `layers.cc:2349-2470`,
+  step-for-step Hero's: preproc (`inputPreprocessForAttentionBody`) -> embed
+  `cublasXgemm`+mish+`LayerNorm(1e-3)` -> **drop the input-gating `2438`** ->
+  embed-FFN d1/mish/d2 + DeepNorm `LayerNorm(alpha=(2L)^-0.25)`. Delta: LN
+  **beta=0** (zero buffer). REUSE with Hero weight names.
+- **expandPlanes** `network_cuda.cc:845` -> `(N,112,8,8)` — REUSE as-is; compute
+  `route[N,64]` (int, device) right after (argmax 13c / +attackers 28c).
+- **EncoderBlock** `layers.cc:1842`: attention QKV/AV/out + LN1/LN2 REUSE;
+  smolgen(`1852-1915`)->static `[heads,64,64]` bias into softmax `input2`(`2010`);
+  FFN(`2053-2073`)->routed loop (INC3)/CUTLASS(INC4); LN eps 1e-3 + zero beta.
+- **Policy** `AttentionPolicyHead`+`PolicyMapLayer` (`2083`, kAttnPolicyMap) ->
+  1858: REUSE near-verbatim (Hero policy has biases, matches). **Value**: ADAPT
+  bias-free attention-read WDL(3), `wdl_=true`; drop MLH.
+- **Gate harness** feeds the oracle's raw `(N,64,112)` planes straight to the
+  forward (bypassing board->planes), compares to `post_stem`/`post_layer0`/
+  `post_trunk`/`policy`/`wdl` npy (GCS `hero/oracle/`). So the forward needs an
+  internal `raw planes -> outputs` entry the harness calls directly.
+
 - **INC3 (next, the big one)** — the CUDA forward: fork lc0's `CudaNetwork`
   run stem + attention (static bias) + heads with a **cuBLAS-loop FFN** (slow,
   correct). Gate: policy/wdl within 1e-2 of the oracle (bf16, L=15).
