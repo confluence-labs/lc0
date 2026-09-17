@@ -59,13 +59,31 @@ lc0's kAttnPolicyMap (4288→1858) for the policy gather. meson: hero_forward.cu
 network_hero.cc are cutlass-gated custom targets. Full lc0 built clean on A100,
 engine ran MCTS, produced legal consistent bestmoves (b4f4). Integration GREEN.
 
-**BUT unoptimized: ~46 nps.** The correct-first Run() re-does host work every
-call: recomputes+re-uploads the (N,H,64,64) static bias for all 15 layers,
-re-uploads head weights per forward (head_gemm's up_f), mallocs/frees ~20
-buffers per call, runs heads in host double-loops. PERF PASS = (1) precompute
-per-layer bias (H,64,64) on device ONCE + a device broadcast kernel per call,
-(2) preallocate all forward buffers in Impl (sized to max batch), (3) preload
-head weights once, (4) move head QK/softmax/AV to device if they bottleneck.
+**PERF PASS 1 (preallocate + device bias + preload heads): 46 -> 56 nps.** Killed
+the per-call trunk overhead (bias re-upload, malloc churn, head-weight uploads)
+— but backendbench exposed the REAL cap: batch 256 took 4.6 SECONDS while the
+trunk bench does 256 in 28ms. The host-side heads (per-position 64x64x256 double
+loops) were 99% of the time.
+
+**PERF PASS 2 (heads fully on GPU): 56 -> 7,344 pos/s. THE unlock.** Moved
+policy+value heads to device — batched-gemm QK/AV (mirroring the trunk attention
+layout, validated) + k_promo/k_pol_gather/k_wdl_mean kernels; Softmax null-bias
+OK. Results on A100 (commit c5b8670):
+
+| batch | forward-only nps | vs pass-1 |
+|-------|------------------|-----------|
+| 8     | 1,175            | 21x       |
+| 64    | 4,736            | 86x       |
+| 256   | **7,344**        | 131x      |
+
+Engine (full MCTS benchmark): 53 -> **4,218 nps** (~80x). Still plays b4f4 —
+correctness held (used the validated head math, just on-device).
+
+**REMAINING HEADROOM:** (1) forward 7,344 vs trunk-bench ~10,700 — gap is the
+heads + host route-sort + real-net FFN; (2) engine 4,218 vs forward 7,344 — MCTS
+batch efficiency (MinibatchSize unset -> backend-suggested; NNCache). Next levers
+in priority: tune MinibatchSize/cache for the engine, CUTLASS grouped FFN for the
+trunk, device-side route-sort to drop the last host sync.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
