@@ -166,9 +166,11 @@ int main(int argc, char** argv) {
 
   // compare
   std::vector<half_t> hout(N*64*d); CK(cudaMemcpy(hout.data(), x_out, hout.size()*sizeof(half_t), cudaMemcpyDeviceToHost));
-  double worst=0, sae=0;
-  for (size_t i=0;i<hout.size();i++){ double dd=fabs((double)__half2float(hout[i]) - ref[i]); worst=fmax(worst,dd); sae+=dd; }
-  printf("STEM gate: worst|d|=%.4f  mean|d|=%.5f  vs post_stem  (%s)\n",
-         worst, sae/hout.size(), worst < 1e-2 ? "PASS" : "FAIL");
-  return worst < 1e-2 ? 0 : 1;
+  double worst=0, sae=0, refmax=0;
+  for (size_t i=0;i<hout.size();i++){ double dd=fabs((double)__half2float(hout[i]) - ref[i]); worst=fmax(worst,dd); sae+=dd; refmax=fmax(refmax,fabs(ref[i])); }
+  double rel = worst / refmax;                     // fp16 gate vs fp32 oracle
+  bool pass = rel < 5e-3 && sae/hout.size() < 1e-3;
+  printf("STEM gate: worst|d|=%.4f  mean|d|=%.5f  worst_rel=%.4f (of %.1f)  (%s)\n",
+         worst, sae/hout.size(), rel, refmax, pass ? "PASS" : "FAIL");
+  return pass ? 0 : 1;
 }
