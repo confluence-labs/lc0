@@ -26,6 +26,7 @@
 */
 
 #include "neural/loader.h"
+#include "neural/hero/hero_weights.h"
 
 #include <zlib.h>
 
@@ -219,6 +220,7 @@ std::optional<WeightsFile> LoadWeights(std::string_view location) {
     net_path = CommandLine::BinaryName();
   }
   if (net_path.empty()) return std::nullopt;
+  if (hero::IsHeroWeightsFile(net_path)) return std::nullopt;  // .htw: loaded by the hero backend
   if (location == SharedBackendParams::kEmbed) {
     CERR << "Using embedded weights from binary: " << net_path;
   } else {
