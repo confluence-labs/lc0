@@ -52,10 +52,28 @@ Apples-to-apples = lc0 `backendbench` (forward-only) for BT4 on the same A100;
 that run is measuring now (first attempt's in-script grep discarded the numbers
 — output format has no 'nps' literal — re-running with raw capture).
 
+**MILESTONE (2026-09-17): --backend=hero PLAYS.** Wired the device forward
+(hero_forward.cu/.h) into ComputeBlocking; network_hero expands InputPlanes,
+runs stem→15 fusedMHA layers→routed FFN→heads, returns policy/WDL. Inverted
+lc0's kAttnPolicyMap (4288→1858) for the policy gather. meson: hero_forward.cu +
+network_hero.cc are cutlass-gated custom targets. Full lc0 built clean on A100,
+engine ran MCTS, produced legal consistent bestmoves (b4f4). Integration GREEN.
+
+**BUT unoptimized: ~46 nps.** The correct-first Run() re-does host work every
+call: recomputes+re-uploads the (N,H,64,64) static bias for all 15 layers,
+re-uploads head weights per forward (head_gemm's up_f), mallocs/frees ~20
+buffers per call, runs heads in host double-loops. PERF PASS = (1) precompute
+per-layer bias (H,64,64) on device ONCE + a device broadcast kernel per call,
+(2) preallocate all forward buffers in Impl (sized to max batch), (3) preload
+head weights once, (4) move head QK/softmax/AV to device if they bottleneck.
+
+Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
+in this fork build (hero backend unaffected — it played). Chase the BT4
+lc0-benchmark baseline flag separately; the 13825 engine-nps reference stands.
+
 NEXT: PRIORITY 2 = FFN co-bottleneck (44%) — 13 sequential per-expert cuBLAS
 gemms; CUTLASS 2.x grouped GEMM (SM80) is the lever, and gets URGENT if the
-45-class/top-k routing lands (up to ~180 gemms/layer). Then wire the validated
-forward into network_hero ComputeBlocking so --backend=hero plays.
+45-class/top-k routing lands (up to ~180 gemms/layer).
 
 ## Target hardware: A100 (CCC parity) — Ampere SM80
 
