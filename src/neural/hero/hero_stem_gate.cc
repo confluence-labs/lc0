@@ -74,12 +74,19 @@ static std::vector<float> load_npy_f32(const std::string& p, std::vector<int>* s
     }
   }
   std::vector<char> rest((std::istreambuf_iterator<char>(f)), {});
-  bool is_i4 = hdr.find("<i4") != std::string::npos;
-  size_t n = rest.size() / 4;
+  int w = hdr.find("u1")!=std::string::npos ? 1
+        : (hdr.find("i8")!=std::string::npos||hdr.find("f8")!=std::string::npos) ? 8 : 4;
+  bool is_i = hdr.find("<i")!=std::string::npos || hdr.find("u1")!=std::string::npos;
+  bool is_f8 = hdr.find("f8")!=std::string::npos;
+  size_t n = rest.size() / w;
   std::vector<float> out(n);
   for (size_t i=0;i<n;i++) {
-    if (is_i4) { int32_t v; memcpy(&v,&rest[i*4],4); out[i]=(float)v; }
-    else       { float v; memcpy(&v,&rest[i*4],4); out[i]=v; }
+    const char* p2=&rest[i*w];
+    if (w==1)        out[i]=(float)(uint8_t)p2[0];
+    else if (is_f8)  { double v; memcpy(&v,p2,8); out[i]=(float)v; }
+    else if (w==8)   { int64_t v; memcpy(&v,p2,8); out[i]=(float)v; }
+    else if (is_i)   { int32_t v; memcpy(&v,p2,4); out[i]=(float)v; }
+    else             { float v; memcpy(&v,p2,4); out[i]=v; }
   }
   return out;
 }
