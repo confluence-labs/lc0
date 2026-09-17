@@ -193,6 +193,47 @@ struct HeroForward::Impl {
     }
   }
 
+  // 28-class route (hero.py routes()/attackers()): empty squares -> control
+  // (att_ours + 2*att_theirs, 0..3); occupied -> 4 + (piece-1) + 12*enemy_attacked.
+  // Sliders see along a ray until (and including) the first occupied square.
+  // Host-side per batch (cheap vs the trunk); planes[n,c,s] channels 0..5 ours
+  // P/N/B/R/Q/K, 6..11 theirs.
+  void route28(const float* pl, int N, std::vector<int>& route) {
+    static bool init=false;
+    static bool knight[64][64],king[64][64],pw_ours[64][64],pw_theirs[64][64];
+    static const int rays[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+    if(!init){ init=true;
+      for(int a=0;a<64;a++)for(int t=0;t<64;t++){
+        int ra=a/8,fa=a%8,rt=t/8,ft=t%8,dR=rt-ra,aF=abs(ft-fa),aR=abs(rt-ra);
+        knight[a][t]=((aR==2&&aF==1)||(aR==1&&aF==2));
+        king[a][t]=(std::max(aR,aF)==1);
+        pw_ours[a][t]=(dR==1&&aF==1); pw_theirs[a][t]=(dR==-1&&aF==1);
+      } }
+    route.assign((size_t)N*64,0);
+    auto Pn=[&](int n,int c,int s){ return pl[((size_t)n*112+c)*64+s]>0.f; };
+    for(int n=0;n<N;n++){
+      bool occ[64]; for(int s=0;s<64;s++){ occ[s]=false; for(int c=0;c<12;c++) if(Pn(n,c,s)){occ[s]=true;break;} }
+      int att_ours[64]={0}, att_theirs[64]={0};
+      for(int from=0;from<64;from++) for(int side=0;side<2;side++){ int off=side*6;
+        int* att = side==0?att_ours:att_theirs;
+        if(Pn(n,off+0,from)) for(int t=0;t<64;t++){ if(side==0?pw_ours[from][t]:pw_theirs[from][t]) att[t]=1; }
+        if(Pn(n,off+1,from)) for(int t=0;t<64;t++){ if(knight[from][t]) att[t]=1; }
+        if(Pn(n,off+5,from)) for(int t=0;t<64;t++){ if(king[from][t]) att[t]=1; }
+        bool bi=Pn(n,off+2,from), rk=Pn(n,off+3,from), qn=Pn(n,off+4,from);
+        if(bi||rk||qn) for(int d=0;d<8;d++){ bool orth=d<4; if(!(orth?(rk||qn):(bi||qn))) continue;
+          int rr=from/8, ff=from%8;
+          for(int k=0;k<7;k++){ rr+=rays[d][0]; ff+=rays[d][1]; if(rr<0||rr>7||ff<0||ff>7) break; int t=rr*8+ff; att[t]=1; if(occ[t]) break; } }
+      }
+      for(int s=0;s<64;s++){
+        int piece=0; float bv=0; for(int c=0;c<12;c++){ float v=pl[((size_t)n*112+c)*64+s]; if(v>0&&(piece==0||v>bv)){bv=v;piece=c+1;} }
+        int rv; if(piece==0) rv=att_ours[s]+2*att_theirs[s];
+        else { int enemy=(piece<=6)?att_theirs[s]:att_ours[s]; rv=4+(piece-1)+12*enemy; }
+        route[(size_t)n*64+s]=rv;
+      }
+    }
+  }
+  void route(const float* pl,int N,std::vector<int>& r){ if(E<=13) route13(pl,N,r); else route28(pl,N,r); }
+
   // device gemm on a head weight into out_dev (rows x out), optional bias+mish
   void head_gemm(half_t* W, int in, int out, half_t* bias, bool mish,
                  half_t* xin_dev, int rows, half_t* out_dev) {
@@ -232,8 +273,8 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,ed,1.f,I.edn,ed,I.up_h,ed,0.f,I.dn_h,d);
   LayerNorm<half_t>(R,d,I.x,I.dn_h,I.zbuf,I.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
 
-  // ---- route + host sort -> order/offsets ----
-  std::vector<int> route; I.route13(planes_nchw,N,route);
+  // ---- route (class-count-aware) + host sort -> order/offsets ----
+  std::vector<int> route; I.route(planes_nchw,N,route);
   std::vector<int> order(R), off(E+1,0), cnt(E,0);
   for (int r=0;r<R;r++) cnt[route[r]]++;
   for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
