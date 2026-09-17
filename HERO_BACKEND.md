@@ -91,6 +91,33 @@ list (no conv/residual, no MLH). Feed layers from `HeroWeights` via the same
   `post_trunk`/`policy`/`wdl` npy (GCS `hero/oracle/`). So the forward needs an
   internal `raw planes -> outputs` entry the harness calls directly.
 
+### INC3 stem — exact op mapping (hero.py -> lc0 cuda kernels), PINNED
+
+KEY: lc0's `LayerNorm(N,C,out,input,bias,skip,g,b,eps,alpha,act)` computes
+**`normalize(activate(input+bias)*alpha + skip)*g + b`** (common_kernels.cu) —
+the act is PRE-normalize, matching Hero's `LN(mish(...))` / DeepNorm exactly.
+So Hero's stem is lc0 kernels in this order (all weights bias-free; pass a zero
+buffer for LN bias/beta; eps 1e-3):
+
+1. preproc (factorised, 2 gemms, NO activation, board-level over 768=64*12):
+   `convertNCHWtoNHWC`(12-plane slice) -> `cublasXgemm(preproc.0 [128,768])`
+   -> `cublasXgemm(preproc.1 [8192,128])` giving pos[N,64,128];
+   then `inputPreprocessForAttentionBody(scratch, planes, pos, N, 112, 128,
+   true)` concats -> [N,64,240]. (lc0's ip_emb_pre is the SAME shape but ONE
+   gemm; Hero adds the 128 bottleneck gemm.)
+2. embed: `cublasXgemm(embed [d,240])` ->
+   `LayerNorm(N*64, d, ..., bias=0, skip=null, embed_ln_g, beta=0, 1e-3,
+   alpha=1, act=MISH)`  == normalize(mish(gemm)).
+3. embed-ffn (DeepNorm): `cublasXgemm(embed_up [embed_dff,d])` -> mish
+   (`addBiasBatched`/Activate) -> `cublasXgemm(embed_down [d,embed_dff])` ->
+   `LayerNorm(..., bias=0, skip=x, embed_ffn_ln_g, beta=0, 1e-3, alpha=(2L)^-0.25,
+   act=NONE)` == normalize(x + alpha*down).
+
+Gate 3a: dump this stem output, compare to `hero/oracle/post_stem.npy` (1e-2).
+Same LN identity powers the encoder LN1 (act=MISH) / LN2 (DeepNorm skip) and
+value/policy head mishes — so the whole non-FFN path reuses lc0 kernels; only
+static-bias + expert-FFN are genuinely new.
+
 - **INC3 (next, the big one)** — the CUDA forward: fork lc0's `CudaNetwork`
   run stem + attention (static bias) + heads with a **cuBLAS-loop FFN** (slow,
   correct). Gate: policy/wdl within 1e-2 of the oracle (bf16, L=15).
