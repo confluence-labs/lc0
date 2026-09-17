@@ -10,15 +10,33 @@ vs ~13.8k BT4 vs ~23k roofline on A100): `confluence-labs/hero-inference`
 
 All file:line refs are this tree (upstream clone, `src/neural/`).
 
-## PERF FINDING (2026-09-17): attention is the bottleneck, NOT the FFN
+## PERF FINDING (2026-09-17): attention was the bottleneck; fusedMHA fixed it
 
 Device-resident trunk bench on A100 (naive attn + per-expert cuBLAS FFN loop):
-~5.3k pos/s, 22% MFU — but split timing shows **attn 76-98%, FFN ~20%**. The
-routed expert FFN (the novel part) is CHEAP; the bottleneck is the STANDARD
-attention (my naive transposes + 32k tiny 64x64 batched gemms). Fix = reuse
-lc0's `fusedMHA` (flash-style, CUTLASS-gated). PRIORITY 1 = fused attention
-(the ~80%), PRIORITY 2 = CUTLASS grouped FFN (the ~20%). Both need a
-meson build with `-Dcutlass=true`, so pivot from standalone nvcc to meson.
+~5.3k pos/s, 22% MFU — split timing showed **attn 76-98%, FFN ~20%**. The
+routed expert FFN (the novel part) is CHEAP; the bottleneck was STANDARD
+attention (naive transposes + 32k tiny 64x64 batched gemms).
+
+**FIX SHIPPED (2026-09-17):** swapped in lc0's `fusedMHA<half_t>(po,qd,kd,vd,
+bias,B,H,hd,0)` under `#ifdef USE_CUTLASS`. It takes q/k/v (N,64,d) interleaved
+straight from the qkv gemms (NO to-heads transpose), applies scale+per-head
+bias+softmax+AV fused, outputs (N,64,d) (NO from-heads transpose). Bias buffer
+(B,H,64,64) already matches its `attn_bias_ptr` strides. Built standalone via
+nvcc: clone cutlass v4.4.1 + `-DUSE_CUTLASS -I cutlass/include -isystem
+third_party`, compile `cutlass_kernels.cu`+`common_kernels.cu`+`fp16_kernels.cu`
+(no meson needed). RESULT on A100-40GB:
+
+| B    | before | after (fusedMHA) | MFU   | attn/ffn |
+|------|--------|------------------|-------|----------|
+| 128  | 4210   | 7244             | 0.306 | 61/39    |
+| 256  | 4784   | 9051             | 0.383 | 58/42    |
+| 512  | 5063   | 9925             | 0.420 | 57/43    |
+| 1024 | 5258   | **10508**        | 0.445 | 57/43    |
+
+2.0x at B=1024 (vs BT4 13825 nps = 76%). Throughput still climbing at B=1024.
+NEXT: PRIORITY 2 = FFN is now the co-bottleneck (43%) — 13 sequential per-expert
+cuBLAS gemms. CUTLASS 2.x grouped GEMM (SM80) is the remaining lever. Also sweep
+B up (2048/4096) to find the throughput ceiling — a bigger batch may clear BT4.
 
 ## Target hardware: A100 (CCC parity) — Ampere SM80
 
