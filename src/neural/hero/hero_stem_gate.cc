@@ -278,5 +278,66 @@ int main(int argc, char** argv) {
   bool passT = wt/rmt < 6e-2 && st/T < 3e-3;   // fp16 accumulated over 15 layers
   printf("TRUNK gate: worst|d|=%.4f mean|d|=%.5f worst_rel=%.4f (of %.1f) (%s)\n",
          wt, st/T, wt/rmt, rmt, passT ? "PASS" : "FAIL");
-  return passT ? 0 : 1;
+  if (!passT) return 1;
+  printf("TRUNK OK — heads (3d)\n");
+
+  // ===================== 3d: policy + value heads =====================
+  const int pd = w.pol_d;
+  auto gemm_dl = [&](const std::vector<float>& W,int in,int out,const std::vector<float>* bias,bool mish,
+                     half_t* xin,int rows)->std::vector<float>{
+    half_t* wt_=upload(W,scratch); half_t* od_; CK(cudaMalloc(&od_,(size_t)rows*out*sizeof(half_t)));
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,1.f,wt_,in,xin,in,0.f,od_,out);
+    if (bias){ half_t* b=upload(*bias,scratch); addBiasBatched<half_t>(od_,od_,b,1,rows,out,mish?ACTIVATION_MISH:ACTIVATION_NONE,0); cudaFree(b); }
+    else if (mish){ addBiasBatched<half_t>(od_,od_,zbuf,1,rows,out,ACTIVATION_MISH,0); }
+    CK(cudaDeviceSynchronize());
+    std::vector<half_t> h((size_t)rows*out); cudaMemcpy(h.data(),od_,h.size()*sizeof(half_t),cudaMemcpyDeviceToHost);
+    std::vector<float> f(h.size()); for(size_t i=0;i<h.size();i++) f[i]=__half2float(h[i]);
+    cudaFree(wt_);cudaFree(od_); return f;
+  };
+  auto gather = load_npy_f32(od + "/gather.npy");   // 1858 int
+
+  // ---- policy ----
+  auto tp = gemm_dl(w.pol_embed_w,d,pd,&w.pol_embed_b,true,x,N*64);      // mish(embed+b)
+  half_t* tpd=upload(tp,scratch);
+  auto qp = gemm_dl(w.pol_q_w,pd,pd,&w.pol_q_b,false,tpd,N*64);
+  auto kp = gemm_dl(w.pol_k_w,pd,pd,&w.pol_k_b,false,tpd,N*64);
+  auto pp = gemm_dl(w.pol_ppo_w,pd,4,nullptr,false,tpd,N*64);            // ppo(t): (N*64,4)
+  double sc = 1.0/sqrt((double)pd);
+  std::vector<float> polout((size_t)N*1858);
+  for (int n=0;n<N;n++){
+    std::vector<float> attn(4096);
+    for(int i=0;i<64;i++)for(int j=0;j<64;j++){ double s=0; for(int c=0;c<pd;c++) s+=(double)qp[((size_t)n*64+i)*pd+c]*kp[((size_t)n*64+j)*pd+c]; attn[i*64+j]=(float)(s*sc); }
+    // promotion (192): off24[f*3+c] = ppo(k[56+f])[c] + ppo(k[56+f])[3]
+    float off24[24]; for(int f=0;f<8;f++)for(int c=0;c<3;c++){ size_t kk=((size_t)n*64+56+f)*4; off24[f*3+c]=pp[kk+c]+pp[kk+3]; }
+    std::vector<float> prom(192);
+    for(int rr=0;rr<8;rr++)for(int f=0;f<8;f++)for(int c=0;c<3;c++) prom[rr*24+f*3+c]=attn[(48+rr)*64+(56+f)]+off24[f*3+c];
+    std::vector<float> cat(4288); memcpy(cat.data(),attn.data(),4096*sizeof(float)); memcpy(cat.data()+4096,prom.data(),192*sizeof(float));
+    for(int m=0;m<1858;m++) polout[(size_t)n*1858+m]=cat[(int)gather[m]];
+  }
+  // ---- value ----
+  auto tv = gemm_dl(w.val_embed_w,d,pd,nullptr,true,x,N*64);            // mish(embed)
+  half_t* tvd=upload(tv,scratch);
+  auto qv = gemm_dl(w.val_q_w,pd,pd,nullptr,false,tvd,N*64);
+  auto kv = gemm_dl(w.val_k_w,pd,pd,nullptr,false,tvd,N*64);
+  auto vv = gemm_dl(w.val_v_w,pd,3,nullptr,false,tvd,N*64);             // (N*64,3)
+  std::vector<float> wdlout((size_t)N*3,0.f);
+  for (int n=0;n<N;n++){
+    double acc[3]={0,0,0};
+    for(int i=0;i<64;i++){
+      double s[64],mx=-1e30; for(int j=0;j<64;j++){ double a=0; for(int c=0;c<pd;c++) a+=(double)qv[((size_t)n*64+i)*pd+c]*kv[((size_t)n*64+j)*pd+c]; s[j]=a*sc; mx=fmax(mx,s[j]); }
+      double z=0; for(int j=0;j<64;j++){ s[j]=exp(s[j]-mx); z+=s[j]; }
+      for(int c=0;c<3;c++){ double o=0; for(int j=0;j<64;j++) o+=s[j]/z*vv[((size_t)n*64+j)*3+c]; acc[c]+=o; }
+    }
+    for(int c=0;c<3;c++) wdlout[(size_t)n*3+c]=(float)(acc[c]/64.0);
+  }
+  // compare
+  auto refP=load_npy_f32(od+"/policy.npy"), refW=load_npy_f32(od+"/wdl.npy");
+  double pw=0,ps=0,prm=0; for(size_t i=0;i<polout.size();i++){double dd=fabs(polout[i]-refP[i]);pw=fmax(pw,dd);ps+=dd;prm=fmax(prm,fabs(refP[i]));}
+  double vw=0; for(size_t i=0;i<wdlout.size();i++) vw=fmax(vw,fabs(wdlout[i]-refW[i]));
+  bool pol_ok = pw/prm<3e-2 && ps/polout.size()<2e-3, val_ok=vw<1e-2;
+  printf("POLICY gate: worst|d|=%.4f mean|d|=%.5f worst_rel=%.4f (of %.1f) (%s)\n", pw, ps/polout.size(), pw/prm, prm, pol_ok?"PASS":"FAIL");
+  printf("VALUE  gate: worst|d|=%.4f wdl0=[%.3f %.3f %.3f] ref=[%.3f %.3f %.3f] (%s)\n",
+         vw, wdlout[0],wdlout[1],wdlout[2], refW[0],refW[1],refW[2], val_ok?"PASS":"FAIL");
+  printf("FULL FORWARD: %s\n", (pol_ok&&val_ok)?"PASS":"FAIL");
+  return (pol_ok&&val_ok)?0:1;
 }
