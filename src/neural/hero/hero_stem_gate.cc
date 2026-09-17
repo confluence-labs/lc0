@@ -114,6 +114,14 @@ int main(int argc, char** argv) {
     flat12[(size_t)n*768 + s*12 + c] = planes[(size_t)n*64*112 + s*112 + c];
   half_t *dPlanes=upload(planes_nchw,scratch), *dFlat=upload(flat12,scratch);
 
+  auto dbg = [&](const char* nm, half_t* p, size_t cnt){
+    std::vector<half_t> h(cnt); cudaMemcpy(h.data(), p, cnt*sizeof(half_t), cudaMemcpyDeviceToHost);
+    double mx=0; int nan=0; for (auto v: h){ float f=__half2float(v); if(f!=f||f==INFINITY||f==-INFINITY)nan++; else mx=fmax(mx,fabs((double)f)); }
+    printf("  [%s] max|finite|=%.3f nan/inf=%d first=%.4f\n", nm, mx, nan, __half2float(h[0]));
+  };
+  dbg("in:dFlat", dFlat, (size_t)N*768);
+  dbg("in:preproc0_w", pp0, w.preproc0_w.size());
+
   // buffers
   half_t *pos128, *pos8192, *cat240, *emb_d, *e_out, *up_h, *dn_h, *x_out;
   CK(cudaMalloc(&pos128,  (size_t)N*128*sizeof(half_t)));
@@ -144,11 +152,6 @@ int main(int argc, char** argv) {
   CK(cudaDeviceSynchronize());
 
   // per-stage diagnostics (localize any NaN/divergence)
-  auto dbg = [&](const char* nm, half_t* p, size_t cnt){
-    std::vector<half_t> h(cnt); cudaMemcpy(h.data(), p, cnt*sizeof(half_t), cudaMemcpyDeviceToHost);
-    double mx=0; int nan=0; for (auto v: h){ float f=__half2float(v); if(f!=f)nan++; mx=fmax(mx,fabs((double)f)); }
-    printf("  [%s] max|.|=%.3f nans=%d first=%.4f\n", nm, mx, nan, __half2float(h[0]));
-  };
   dbg("pos128", pos128, (size_t)N*128);
   dbg("cat240", cat240, (size_t)N*64*240);
   dbg("e_out(LNmish)", e_out, (size_t)N*64*d);
