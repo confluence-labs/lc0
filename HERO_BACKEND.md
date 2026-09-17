@@ -119,7 +119,14 @@ Same LN identity powers the encoder LN1 (act=MISH) / LN2 (DeepNorm skip) and
 value/policy head mishes — so the whole non-FFN path reuses lc0 kernels; only
 static-bias + expert-FFN are genuinely new.
 
-- **INC3 (next, the big one)** — the CUDA forward: fork lc0's `CudaNetwork`
+- **INC3a/b/c DONE (2026-09-17)** — stem, attention (static geo bias), AND the
+  routed expert-FFN loop all reproduce the oracle in CUDA (a full encoder layer,
+  mean|d| ~2e-4). The novel routed FFN — Hero's raison d'etre — is validated
+  (cuBLAS-loop; CUTLASS is INC4). geo_basis() ported to C++. Gate:
+  `src/neural/hero/hero_stem_gate.cc` (stem->attn->layer0 staged vs oracle npy).
+- **INC3d (next)** — loop all 15 layers + policy/value heads -> policy/wdl,
+  gate vs oracle policy.npy/wdl.npy. Then wire into network_hero's ComputeBlocking.
+- **INC3 (superseded framing)** — fork lc0's `CudaNetwork`
   run stem + attention (static bias) + heads with a **cuBLAS-loop FFN** (slow,
   correct). Gate: policy/wdl within 1e-2 of the oracle (bf16, L=15).
 - **S3b** — routes()/geo_basis()/attackers() as CUDA (or host precompute the
