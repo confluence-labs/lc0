@@ -218,6 +218,15 @@ int main(int argc, char** argv) {
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,kw,d,x,d,0.f,kd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,vw,d,x,d,0.f,vd,d);
     CK(cudaDeviceSynchronize());
+    half_t* pout;
+#ifdef USE_CUTLASS
+    // fused flash attention (the fast path we ship). q/k/v (N,64,d) interleaved
+    // straight from the gemms — NO to_heads; +dBias(N,H,64,64), scale+softmax+AV
+    // fused; out (N,64,d) — NO from_heads. This gates fusedMHA vs the oracle.
+    CK(cudaMalloc(&pout,T*sizeof(half_t)));
+    fusedMHA<half_t>(pout, qd, kd, vd, dBias, N, H, hd, 0);
+    CK(cudaDeviceSynchronize());
+#else
     auto to_heads=[&](half_t* src,std::vector<half_t>& dst){
       std::vector<half_t> h(T); cudaMemcpy(h.data(),src,T*sizeof(half_t),cudaMemcpyDeviceToHost); dst.resize(T);
       for(int n=0;n<N;n++)for(int s=0;s<64;s++)for(int hh=0;hh<H;hh++)for(int e=0;e<hd;e++)
@@ -230,9 +239,10 @@ int main(int argc, char** argv) {
     Softmax<half_t>(N*H*64,64,scores,scores,dBias,0);
     CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,hd,64,64,&o,vt,CUDA_R_16F,hd,64*hd,scores,CUDA_R_16F,64,64*64,&z,ctx,CUDA_R_16F,hd,64*hd,N*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     CK(cudaDeviceSynchronize());
-    half_t* pout; { std::vector<half_t> c(T); cudaMemcpy(c.data(),ctx,T*sizeof(half_t),cudaMemcpyDeviceToHost);
+    { std::vector<half_t> c(T); cudaMemcpy(c.data(),ctx,T*sizeof(half_t),cudaMemcpyDeviceToHost);
       std::vector<half_t> ob(T); for(int n=0;n<N;n++)for(int s=0;s<64;s++)for(int hh=0;hh<H;hh++)for(int e=0;e<hd;e++)
         ob[((size_t)n*64+s)*d+hh*hd+e]=c[(((size_t)n*H+hh)*64+s)*hd+e]; pout=upload_h(ob,scratch); }
+#endif
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,ow,d,pout,d,0.f,attn_out,d);
     half_t* x_attn; CK(cudaMalloc(&x_attn,T*sizeof(half_t)));
     LayerNorm<half_t>(N*64,d,x_attn,attn_out,zbuf,x,l1g,zbuf,1e-3f,alpha,ACTIVATION_NONE,0);
@@ -261,10 +271,13 @@ int main(int argc, char** argv) {
     half_t* x_next; CK(cudaMalloc(&x_next,T*sizeof(half_t)));
     LayerNorm<half_t>(N*64,d,x_next,ffn_out,zbuf,x_attn,l2g,zbuf,1e-3f,alpha,ACTIVATION_NONE,0);
     CK(cudaDeviceSynchronize());
-    cudaFree(qd);cudaFree(kd);cudaFree(vd);cudaFree(attn_out);cudaFree(scores);cudaFree(ctx);
+    cudaFree(qd);cudaFree(kd);cudaFree(vd);cudaFree(attn_out);
     cudaFree(x_attn);cudaFree(ffn_out);cudaFree(gin);cudaFree(gh);cudaFree(gout);
     cudaFree(dBias);cudaFree(qw);cudaFree(kw);cudaFree(vw);cudaFree(ow);cudaFree(l1g);cudaFree(l2g);
-    cudaFree(qt);cudaFree(kt);cudaFree(vt);cudaFree(pout);
+    cudaFree(pout);
+#ifndef USE_CUTLASS
+    cudaFree(scores);cudaFree(ctx);cudaFree(qt);cudaFree(kt);cudaFree(vt);
+#endif
     return x_next;
   };
 
