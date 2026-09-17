@@ -137,6 +137,8 @@ common_files += [
   'src/neural/encoder.cc',
   'src/neural/factory.cc',
   'src/neural/loader.cc',
+  'src/neural/hero/hero_weights.cc',
+  'src/neural/hero/network_hero.cc',
   'src/neural/register.cc',
   'src/neural/shared_params.cc',
   'src/neural/wrapper.cc',

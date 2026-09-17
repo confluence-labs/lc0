@@ -26,6 +26,7 @@
 */
 
 #include "neural/factory.h"
+#include "neural/hero/hero_weights.h"
 
 #include <algorithm>
 
@@ -102,7 +103,8 @@ std::unique_ptr<Network> NetworkFactory::LoadNetwork(
       options.Get<std::string>(SharedBackendParams::kBackendOptionsId);
 
   std::optional<WeightsFile> weights;
-  if (!net_path.empty()) weights = LoadWeights(net_path);
+  if (!net_path.empty() && !hero::IsHeroWeightsFile(net_path))
+    weights = LoadWeights(net_path);
   OptionsDict network_options(&options);
   network_options.AddSubdictFromString(backend_options);
 
