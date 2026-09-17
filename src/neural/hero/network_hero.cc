@@ -62,7 +62,7 @@ class HeroNetwork : public Network {
   std::unique_ptr<NetworkComputation> NewComputation() override {
     return std::make_unique<HeroNetworkComputation>(this);
   }
-  int GetMiniBatchSize() const override { return 256; }
+  int GetMiniBatchSize() const override { return 384; }
 
   hero::HeroForward& forward() { return forward_; }
   const std::vector<int>& gather() const { return gather_; }

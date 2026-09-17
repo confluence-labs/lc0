@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "neural/hero/hero_forward.h"
@@ -110,6 +111,9 @@ __global__ void k_wdl_mean(float* wdl,const half_t* vout,int N){
 struct HeroForward::Impl {
   HeroWeights w;               // host weights kept only for head-side host math
   cublasHandle_t cub;
+  std::mutex mtx;              // lc0 calls ComputeBlocking from multiple search
+                              // threads; one GPU -> serialize the forward (leaf
+                              // collection still runs parallel on the CPU side)
   int d, L, H, hd, dff, E, ed, pd;
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
@@ -156,7 +160,7 @@ struct HeroForward::Impl {
     h_pq=up_f(w.pol_q_w); h_pqb=up_f(w.pol_q_b); h_pk=up_f(w.pol_k_w); h_pkb=up_f(w.pol_k_b);
     h_ve=up_f(w.val_embed_w); h_vq=up_f(w.val_q_w); h_vk=up_f(w.val_k_w); h_vv=up_f(w.val_v_w);
     h_ppo=up_f(w.pol_ppo_w);
-    ensure(256);
+    ensure(512);   // preallocate for the useful minibatch range (no mid-search realloc)
   }
 
   void ensure(int N) {                 // (re)allocate scratch for batch N
@@ -204,7 +208,7 @@ HeroForward::~HeroForward() { delete p_; }
 
 void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
                       const std::vector<int>& gather, float* policy_out, float* wdl_out) {
-  Impl& I=*p_; I.ensure(N); cublasHandle_t cub=I.cub;
+  Impl& I=*p_; std::lock_guard<std::mutex> lk(I.mtx); I.ensure(N); cublasHandle_t cub=I.cub;
   const int d=I.d,H=I.H,hd=I.hd,dff=I.dff,E=I.E,ed=I.ed,pd=I.pd; const float al=I.alpha;
   const size_t T=(size_t)N*64*d; const int R=N*64;
 
