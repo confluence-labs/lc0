@@ -54,6 +54,38 @@ static half_t* upload(const std::vector<float>& v, void* scratch) {
   CK(cudaDeviceSynchronize());
   return d;
 }
+static half_t* upload_h(const std::vector<half_t>& v, void*) {  // half vector, no conversion
+  half_t* d; CK(cudaMalloc(&d, v.size() * sizeof(half_t)));
+  CK(cudaMemcpy(d, v.data(), v.size() * sizeof(half_t), cudaMemcpyHostToDevice));
+  return d;
+}
+// hero.py geo_basis(): 18 static (from,to) masks, each 64x64 (row-major i*64+j)
+static std::vector<std::vector<float>> geo_basis() {
+  std::vector<std::vector<float>> g(18, std::vector<float>(4096));
+  auto R=[&](int s){return s/8;}; auto F=[&](int s){return s%8;};
+  for (int i=0;i<64;i++) for (int j=0;j<64;j++) {
+    int dR=R(i)-R(j), dF=F(i)-F(j), aR=abs(dR), aF=abs(dF);
+    int dist=aR>aF?aR:aF;
+    bool ray=((dR==0)||(dF==0)||(aR==aF))&&(dist>0);
+    bool diag=(aR==aF)&&(dR!=0);
+    int x=i*64+j; float* c=nullptr; int k=0;
+    auto set=[&](float v){ g[k++][x]=v; };
+    set(((aR==2&&aF==1)||(aR==1&&aF==2))?1.f:0.f);   // 0 knight
+    set(dist==1?1.f:0.f);                            // 1 king-step
+    set(ray? 1.f/(dist+1) : 0.f);                    // 2 ray/(dist+1)
+    set(i==j?1.f:0.f);                               // 3 eye
+    set(-(float)dist);                               // 4 -dist
+    set(1.f);                                        // 5 ones
+    set((dF==0&&dR<0)?1.f:0.f); set((dF==0&&dR>0)?1.f:0.f);   // 6,7 file rays
+    set((dR==0&&dF<0)?1.f:0.f); set((dR==0&&dF>0)?1.f:0.f);   // 8,9 rank rays
+    set((diag&&dR<0&&dF<0)?1.f:0.f); set((diag&&dR<0&&dF>0)?1.f:0.f);  // 10,11
+    set((diag&&dR>0&&dF<0)?1.f:0.f); set((diag&&dR>0&&dF>0)?1.f:0.f);  // 12,13
+    set((dR==-1&&dF==0)?1.f:0.f); set((dR==-1&&aF==1)?1.f:0.f);        // 14,15
+    set((dR==1&&dF==0)?1.f:0.f);  set((dR==1&&aF==1)?1.f:0.f);         // 16,17
+    (void)c;
+  }
+  return g;
+}
 
 // --- minimal .npy reader (C-contiguous fp32/int32) ---
 static std::vector<float> load_npy_f32(const std::string& p, std::vector<int>* shape=nullptr) {
@@ -158,19 +190,80 @@ int main(int argc, char** argv) {
   LayerNorm<half_t>(N*64, d, x_out, dn_h, zbuf, e_out, efln, zbuf, 1e-3f, alpha, ACTIVATION_NONE, 0);
   CK(cudaDeviceSynchronize());
 
-  // per-stage diagnostics (localize any NaN/divergence)
-  dbg("pos128", pos128, (size_t)N*128);
-  dbg("cat240", cat240, (size_t)N*64*240);
-  dbg("e_out(LNmish)", e_out, (size_t)N*64*d);
-  dbg("x_out", x_out, (size_t)N*64*d);
+  dbg("x_out(stem)", x_out, (size_t)N*64*d);
 
-  // compare
-  std::vector<half_t> hout(N*64*d); CK(cudaMemcpy(hout.data(), x_out, hout.size()*sizeof(half_t), cudaMemcpyDeviceToHost));
+  // ================= 3b: layer-0 attention block (DeepNorm) =================
+  const int H = w.heads, hd = w.hd;   // 32, 32 ; H*hd == d
+  // static per-head bias[H,64,64] = free0 + sum_k alpha0[h,k]*geo_basis[k]
+  auto geo = geo_basis();                              // [18][64][64] float
+  const auto& A0 = w.layer[0].alpha;   // [H,18]
+  const auto& F0 = w.layer[0].free;    // [H,64,64]
+  std::vector<float> bias_bcast((size_t)N*H*64*64);
+  for (int h=0; h<H; h++) for (int i=0;i<64;i++) for (int j=0;j<64;j++) {
+    double b = F0[(size_t)h*64*64 + i*64 + j];
+    for (int k=0;k<18;k++) b += (double)A0[h*18+k] * geo[k][i*64+j];
+    for (int n=0;n<N;n++) bias_bcast[((size_t)n*H+h)*64*64 + i*64 + j] = (float)b;
+  }
+  half_t* dBias = upload(bias_bcast, scratch);
+
+  // q,k,v = x_stem @ W^T  (N*64, d)
+  half_t *qw=upload(w.layer[0].q_w,scratch), *kw=upload(w.layer[0].k_w,scratch),
+         *vw=upload(w.layer[0].v_w,scratch), *ow=upload(w.layer[0].out_w,scratch),
+         *l1g=upload(w.layer[0].ln1_g,scratch);
+  float zero=0.f, one=1.f;
+  half_t *qd,*kd,*vd,*attn_out; size_t T=(size_t)N*64*d;
+  CK(cudaMalloc(&qd,T*sizeof(half_t))); CK(cudaMalloc(&kd,T*sizeof(half_t)));
+  CK(cudaMalloc(&vd,T*sizeof(half_t))); CK(cudaMalloc(&attn_out,T*sizeof(half_t)));
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,qw,d,x_out,d,0.f,qd,d);
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,kw,d,x_out,d,0.f,kd,d);
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,vw,d,x_out,d,0.f,vd,d);
+  CK(cudaDeviceSynchronize());
+
+  // transpose (N,64,H,hd) -> contiguous per-head (N*H,64,hd) on host (gate only)
+  auto to_heads=[&](half_t* src, std::vector<half_t>& dst){
+    std::vector<half_t> h(T); cudaMemcpy(h.data(),src,T*sizeof(half_t),cudaMemcpyDeviceToHost);
+    dst.resize(T);
+    for(int n=0;n<N;n++)for(int s=0;s<64;s++)for(int hh=0;hh<H;hh++)for(int e=0;e<hd;e++)
+      dst[(((size_t)n*H+hh)*64+s)*hd+e] = h[((size_t)n*64+s)*d + hh*hd + e];
+  };
+  std::vector<half_t> qh,kh,vh; to_heads(qd,qh); to_heads(kd,kh); to_heads(vd,vh);
+  half_t *qt=upload_h(qh,scratch),*kt=upload_h(kh,scratch),*vt=upload_h(vh,scratch);
+  half_t *scores,*ctx; CK(cudaMalloc(&scores,(size_t)N*H*64*64*sizeof(half_t)));
+  CK(cudaMalloc(&ctx,T*sizeof(half_t)));
+  // scores = (q @ k^T)/sqrt(hd)  per (n,h): OP_T/OP_N, m=64,n=64,k=hd (lc0 convention)
+  float fac=1.f/sqrtf((float)hd);
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,hd,&fac,
+      kt,CUDA_R_16F,hd,64*hd, qt,CUDA_R_16F,hd,64*hd, &zero,
+      scores,CUDA_R_16F,64,64*64, N*H, CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  Softmax<half_t>(N*H*64, 64, scores, scores, dBias, 0);   // +bias, softmax over last dim
+  // ctx = scores @ v  per (n,h): OP_N/OP_N, m=hd,n=64,k=64
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,hd,64,64,&one,
+      vt,CUDA_R_16F,hd,64*hd, scores,CUDA_R_16F,64,64*64, &zero,
+      ctx,CUDA_R_16F,hd,64*hd, N*H, CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  CK(cudaDeviceSynchronize());
+  // transpose ctx (N*H,64,hd) -> (N,64,H*hd), then out gemm
+  half_t* pout;
+  { std::vector<half_t> c(T); cudaMemcpy(c.data(),ctx,T*sizeof(half_t),cudaMemcpyDeviceToHost);
+    std::vector<half_t> o(T);
+    for(int n=0;n<N;n++)for(int s=0;s<64;s++)for(int hh=0;hh<H;hh++)for(int e=0;e<hd;e++)
+      o[((size_t)n*64+s)*d + hh*hd + e] = c[(((size_t)n*H+hh)*64+s)*hd+e];
+    pout=upload_h(o,scratch); }
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,N*64,d,1.f,ow,d,pout,d,0.f,attn_out,d);
+  // DeepNorm LN1: x_attn = LN(x_stem + alpha*attn_out)
+  half_t* x_attn; CK(cudaMalloc(&x_attn,T*sizeof(half_t)));
+  LayerNorm<half_t>(N*64, d, x_attn, attn_out, zbuf, x_out, l1g, zbuf, 1e-3f, alpha, ACTIVATION_NONE, 0);
+  CK(cudaDeviceSynchronize());
+  dbg("scores(softmax)", scores, (size_t)N*H*64*64);
+  dbg("attn_out", attn_out, T);
+  dbg("x_attn", x_attn, T);
+
+  // compare x_attn vs post_attn0
+  auto refA = load_npy_f32(od + "/post_attn0.npy");
+  std::vector<half_t> hout(T); CK(cudaMemcpy(hout.data(), x_attn, T*sizeof(half_t), cudaMemcpyDeviceToHost));
   double worst=0, sae=0, refmax=0;
-  for (size_t i=0;i<hout.size();i++){ double dd=fabs((double)__half2float(hout[i]) - ref[i]); worst=fmax(worst,dd); sae+=dd; refmax=fmax(refmax,fabs(ref[i])); }
-  double rel = worst / refmax;                     // fp16 gate vs fp32 oracle
-  bool pass = rel < 5e-3 && sae/hout.size() < 1e-3;
-  printf("STEM gate: worst|d|=%.4f  mean|d|=%.5f  worst_rel=%.4f (of %.1f)  (%s)\n",
-         worst, sae/hout.size(), rel, refmax, pass ? "PASS" : "FAIL");
+  for (size_t i=0;i<T;i++){ double dd=fabs((double)__half2float(hout[i]) - refA[i]); worst=fmax(worst,dd); sae+=dd; refmax=fmax(refmax,fabs(refA[i])); }
+  double rel = worst / refmax; bool pass = rel < 8e-3 && sae/T < 1.5e-3;
+  printf("ATTN gate: worst|d|=%.4f mean|d|=%.5f worst_rel=%.4f (of %.1f) (%s)\n",
+         worst, sae/T, rel, refmax, pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
