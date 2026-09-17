@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
   LayerNorm<half_t>(N*64, d, e_out, emb_d, zbuf, (half_t*)nullptr, eln, zbuf, 1e-3f, 1.f, ACTIVATION_MISH, 0);
   // embed_ffn: up -> mish -> down -> LN(e + alpha*down)
   gemm(cub, CUBLAS_OP_T, CUBLAS_OP_N, ed, N*64, d, 1.f, eu, d, e_out, d, 0.f, up_h, ed);
-  Activate(N*64*ed, ACTIVATION_MISH, up_h, up_h, 0);
+  addBiasBatched<half_t>(up_h, up_h, zbuf, 1, N*64, ed, ACTIVATION_MISH, 0);  // zero-bias mish (zbuf has d>=ed zeros)
   gemm(cub, CUBLAS_OP_T, CUBLAS_OP_N, d, N*64, ed, 1.f, edn, ed, up_h, ed, 0.f, dn_h, d);
   float alpha = powf(2.f * w.layers, -0.25f);
   LayerNorm<half_t>(N*64, d, x_out, dn_h, zbuf, e_out, efln, zbuf, 1e-3f, alpha, ACTIVATION_NONE, 0);
