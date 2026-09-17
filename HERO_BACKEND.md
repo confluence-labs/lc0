@@ -59,7 +59,13 @@ Reference `.htw` + oracle (planes/policy/wdl npy) in GCS `hero/`.
 ## Build sequence (each gates against the oracle)
 
 - **S1 DONE** — fork builds clean; BT4 `.pb` still runs (no regression).
-- **S3a** — `.htw` loader + `HeroWeights` + `-hero` registration; parse + upload,
+- **INC1 DONE** — `.htw` loader + `HeroWeights` (`src/neural/hero/hero_weights.{h,cc}`):
+  loads the real 1.08 GB net, fp16->fp32 bit-exact vs a Python decode.
+- **INC2 DONE** — `-hero` registration + `.htw` routing
+  (`src/neural/hero/network_hero.cc`; sniff in `loader.cc:LoadWeights`; path
+  injected in `wrapper.cc`). `--backend=hero --weights=x.htw` loads the net
+  through the real lc0 binary ("Hero net loaded: d=1024 ..."), forward stubs.
+- **INC3 (next, the big one)** — the CUDA forward: fork lc0's `CudaNetwork`
   run stem + attention (static bias) + heads with a **cuBLAS-loop FFN** (slow,
   correct). Gate: policy/wdl within 1e-2 of the oracle (bf16, L=15).
 - **S3b** — routes()/geo_basis()/attackers() as CUDA (or host precompute the
