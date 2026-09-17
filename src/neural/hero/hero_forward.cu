@@ -85,6 +85,26 @@ __global__ void k_scatter(half_t* o,const half_t* in,const int* idx,int d){
 // broadcast per-head bias (H,64,64) -> (N,H,64,64) for fusedMHA (batch-independent)
 __global__ void k_bcast_bias(half_t* o,const half_t* b,int HB){  // HB = H*64*64
   int n=blockIdx.y, x=blockIdx.x*blockDim.x+threadIdx.x; if(x<HB) o[(size_t)n*HB+x]=b[x]; }
+// promotion logits: po[n,f,c] = sum_e kp[n,56+f,e]*PPO[c,e]  (f 0..7, c 0..3)
+__global__ void k_promo(half_t* po,const half_t* kp,const half_t* PPO,int N,int pd){
+  int n=blockIdx.x, f=blockIdx.y, c=threadIdx.x; if(c>=4) return;
+  const half_t* kr=kp+((size_t)n*64+56+f)*pd; const half_t* pr=PPO+(size_t)c*pd;
+  float s=0; for(int e=0;e<pd;e++) s+=__half2float(kr[e])*__half2float(pr[e]);
+  po[((size_t)n*8+f)*4+c]=__float2half(s); }
+// policy gather: cat4288[i*64+j | 4096+promo] -> 1858 via the fixed lc0 map
+__global__ void k_pol_gather(float* pol,const half_t* sc,const half_t* po,const int* g,int N){
+  int n=blockIdx.x, m=blockIdx.y*blockDim.x+threadIdx.x; if(m>=1858) return;
+  int idx=g[m]; float v;
+  if(idx<4096) v=__half2float(sc[(size_t)n*4096+idx]);
+  else { int p=idx-4096, rr=p/24, f=(p%24)/3, c=p%3;
+    float base=__half2float(sc[(size_t)n*4096+(48+rr)*64+(56+f)]);
+    v=base+__half2float(po[((size_t)n*8+f)*4+c])+__half2float(po[((size_t)n*8+f)*4+3]); }
+  pol[(size_t)n*1858+m]=v; }
+// WDL = mean over the 64 query rows of the value attention output (N,64,3)
+__global__ void k_wdl_mean(float* wdl,const half_t* vout,int N){
+  int n=blockIdx.x, c=threadIdx.x; if(c>=3) return;
+  float s=0; for(int i=0;i<64;i++) s+=__half2float(vout[((size_t)n*64+i)*3+c]);
+  wdl[(size_t)n*3+c]=s/64.f; }
 
 // ============================ the forward object ============================
 struct HeroForward::Impl {
@@ -98,13 +118,16 @@ struct HeroForward::Impl {
   half_t *pp0,*pp1,*emb,*eln,*eu,*edn,*efln,*zbuf;
   struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias; };  // bias: (H,64,64) fp16
   std::vector<LW> lw;
-  // head weights (device, uploaded once)
-  half_t *h_pe,*h_peb,*h_pq,*h_pqb,*h_pk,*h_pkb,*h_ve,*h_vq,*h_vk,*h_vv;
+  // head weights (device, uploaded once) + policy-promotion + gather map
+  half_t *h_pe,*h_peb,*h_pq,*h_pqb,*h_pk,*h_pkb,*h_ve,*h_vq,*h_vk,*h_vv,*h_ppo;
+  int* dGather=nullptr;        // 1858 policy move indices (uploaded on first Run)
 
   // ---- scratch (device, sized to capN) ----
   half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
   half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn,*dBias;
-  half_t *hd_in,*hd_out;       // head gemm scratch
+  // device head scratch
+  half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
+  float *d_pol,*d_wdl;
   int *dOrder;
 
   Impl(const HeroWeights& wt) : w(wt) {
@@ -132,22 +155,28 @@ struct HeroForward::Impl {
     h_pe=up_f(w.pol_embed_w); h_peb=up_f(w.pol_embed_b);
     h_pq=up_f(w.pol_q_w); h_pqb=up_f(w.pol_q_b); h_pk=up_f(w.pol_k_w); h_pkb=up_f(w.pol_k_b);
     h_ve=up_f(w.val_embed_w); h_vq=up_f(w.val_q_w); h_vk=up_f(w.val_k_w); h_vv=up_f(w.val_v_w);
+    h_ppo=up_f(w.pol_ppo_w);
     ensure(256);
   }
 
   void ensure(int N) {                 // (re)allocate scratch for batch N
     if (N <= capN) return;
     if (capN) { for (half_t* p : {dPlanes,dFlat,pos128,pos8192,cat240,emb_d,e_out,up_h,dn_h,x,
-                                   qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,dBias,hd_in,hd_out}) cudaFree(p);
-                cudaFree(dOrder); }
+                                   qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,dBias,
+                                   tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
+                cudaFree(dOrder); cudaFree(d_pol); cudaFree(d_wdl); }
     const size_t T=(size_t)N*64*d, R=(size_t)N*64;
     auto A=[&](half_t** p,size_t n){ CK(cudaMalloc(p,n*sizeof(half_t))); };
     A(&dPlanes,(size_t)N*112*64); A(&dFlat,(size_t)N*768); A(&pos128,(size_t)N*128);
     A(&pos8192,(size_t)N*8192); A(&cat240,R*240); A(&emb_d,T); A(&e_out,T);
     A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,T); A(&kd,T); A(&vd,T); A(&po,T);
     A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
-    A(&dBias,(size_t)N*H*64*64); A(&hd_in,R*(size_t)pd); A(&hd_out,R*(size_t)pd);
+    A(&dBias,(size_t)N*H*64*64);
+    A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
+    A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
+    A(&vvh,R*3); A(&scv,(size_t)N*4096); A(&vout,R*3);
     CK(cudaMalloc(&dOrder,R*sizeof(int)));
+    CK(cudaMalloc(&d_pol,(size_t)N*1858*sizeof(float))); CK(cudaMalloc(&d_wdl,(size_t)N*3*sizeof(float)));
     capN = N;
   }
 
@@ -160,17 +189,12 @@ struct HeroForward::Impl {
     }
   }
 
-  // device gemm on a head weight, download result to host fp32 (rows x out)
-  std::vector<float> head_gemm(half_t* W, int in, int out, half_t* bias, bool mish,
-                               half_t* xin_dev, int rows) {
-    half_t* od=hd_out;  // out<=pd; hd_out sized rows*pd
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,1.f,W,in,xin_dev,in,0.f,od,out);
-    if (bias) addBiasBatched<half_t>(od,od,bias,1,rows,out,mish?ACTIVATION_MISH:ACTIVATION_NONE,0);
-    else if (mish) addBiasBatched<half_t>(od,od,zbuf,1,rows,out,ACTIVATION_MISH,0);
-    CK(cudaDeviceSynchronize());
-    std::vector<half_t> h((size_t)rows*out); cudaMemcpy(h.data(),od,h.size()*sizeof(half_t),cudaMemcpyDeviceToHost);
-    std::vector<float> f(h.size()); for(size_t i=0;i<h.size();i++) f[i]=__half2float(h[i]);
-    return f;
+  // device gemm on a head weight into out_dev (rows x out), optional bias+mish
+  void head_gemm(half_t* W, int in, int out, half_t* bias, bool mish,
+                 half_t* xin_dev, int rows, half_t* out_dev) {
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,1.f,W,in,xin_dev,in,0.f,out_dev,out);
+    if (bias) addBiasBatched<half_t>(out_dev,out_dev,bias,1,rows,out,mish?ACTIVATION_MISH:ACTIVATION_NONE,0);
+    else if (mish) addBiasBatched<half_t>(out_dev,out_dev,zbuf,1,rows,out,ACTIVATION_MISH,0);
   }
 };
 
@@ -234,41 +258,30 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
   }
 
-  // ---- heads (device gemms with preloaded weights; 64x64 attention host) ----
-  double sc = 1.0/sqrt((double)pd);
-  // policy: tp = mish(pol_embed(x)+b); qp,kp = pol_q/k(tp)
-  auto tp = I.head_gemm(I.h_pe,d,pd,I.h_peb,true,I.x,R);
-  half_t* tpd=up_f(tp);
-  auto qp = I.head_gemm(I.h_pq,pd,pd,I.h_pqb,false,tpd,R);
-  auto kp = I.head_gemm(I.h_pk,pd,pd,I.h_pkb,false,tpd,R);
-  cudaFree(tpd);
-  const auto& PPO=I.w.pol_ppo_w;
-  for (int n=0;n<N;n++){
-    std::vector<float> attn(4096);
-    for(int i=0;i<64;i++)for(int j=0;j<64;j++){ double s=0; for(int c=0;c<pd;c++) s+=(double)qp[((size_t)n*64+i)*pd+c]*kp[((size_t)n*64+j)*pd+c]; attn[i*64+j]=(float)(s*sc); }
-    float off24[24]; for(int f=0;f<8;f++){ double po[4];
-      for(int c=0;c<4;c++){ double s=0; for(int e=0;e<pd;e++) s+=(double)kp[((size_t)n*64+56+f)*pd+e]*PPO[c*pd+e]; po[c]=s; }
-      for(int c=0;c<3;c++) off24[f*3+c]=(float)(po[c]+po[3]); }
-    std::vector<float> cat(4288); memcpy(cat.data(),attn.data(),4096*sizeof(float));
-    for(int rr=0;rr<8;rr++)for(int f=0;f<8;f++)for(int c=0;c<3;c++) cat[4096+rr*24+f*3+c]=attn[(48+rr)*64+(56+f)]+off24[f*3+c];
-    for(int m=0;m<1858;m++) policy_out[(size_t)n*1858+m]=cat[gather[m]];
-  }
-  // value: tv = mish(val_embed(x)); qv,kv,vv
-  auto tv = I.head_gemm(I.h_ve,d,pd,nullptr,true,I.x,R);
-  half_t* tvd=up_f(tv);
-  auto qv = I.head_gemm(I.h_vq,pd,pd,nullptr,false,tvd,R);
-  auto kv = I.head_gemm(I.h_vk,pd,pd,nullptr,false,tvd,R);
-  auto vv = I.head_gemm(I.h_vv,pd,3,nullptr,false,tvd,R);
-  cudaFree(tvd);
-  for (int n=0;n<N;n++){
-    double acc[3]={0,0,0};
-    for(int i=0;i<64;i++){
-      double s[64],mx=-1e30; for(int j=0;j<64;j++){ double a=0; for(int c=0;c<pd;c++) a+=(double)qv[((size_t)n*64+i)*pd+c]*kv[((size_t)n*64+j)*pd+c]; s[j]=a*sc; mx=fmax(mx,s[j]); }
-      double z=0; for(int j=0;j<64;j++){ s[j]=exp(s[j]-mx); z+=s[j]; }
-      for(int c=0;c<3;c++){ double o=0; for(int j=0;j<64;j++) o+=s[j]/z*vv[((size_t)n*64+j)*3+c]; acc[c]+=o; }
-    }
-    for(int c=0;c<3;c++) wdl_out[(size_t)n*3+c]=(float)(acc[c]/64.0);
-  }
+  // ---- heads (fully device-resident) ----
+  if (!I.dGather) { CK(cudaMalloc(&I.dGather,1858*sizeof(int)));
+    CK(cudaMemcpy(I.dGather,gather.data(),1858*sizeof(int),cudaMemcpyHostToDevice)); }
+  const float sc = 1.f/sqrtf((float)pd), z=0.f, o=1.f;
+  // policy: tp = mish(pol_embed(x)+b); qp,kp = pol_q/k(tp)+b; scp = qp.kp^T*sc; +promo; gather
+  I.head_gemm(I.h_pe,d,pd,I.h_peb,true,I.x,R,I.tp);
+  I.head_gemm(I.h_pq,pd,pd,I.h_pqb,false,I.tp,R,I.qp);
+  I.head_gemm(I.h_pk,pd,pd,I.h_pkb,false,I.tp,R,I.kp);
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,I.kp,CUDA_R_16F,pd,64*pd,I.qp,CUDA_R_16F,pd,64*pd,&z,I.scp,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  { dim3 pg(N,8); k_promo<<<pg,4>>>(I.promo,I.kp,I.h_ppo,N,pd); }
+  { dim3 gg(N,(1858+255)/256); k_pol_gather<<<gg,256>>>(I.d_pol,I.scp,I.promo,I.dGather,N); }
+  // value: tv = mish(val_embed(x)); qv,kv,vv; softmax(qv.kv^T*sc) then .vv, mean over queries
+  I.head_gemm(I.h_ve,d,pd,nullptr,true,I.x,R,I.tv);
+  I.head_gemm(I.h_vq,pd,pd,nullptr,false,I.tv,R,I.qv);
+  I.head_gemm(I.h_vk,pd,pd,nullptr,false,I.tv,R,I.kv);
+  I.head_gemm(I.h_vv,pd,3,nullptr,false,I.tv,R,I.vvh);
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,I.kv,CUDA_R_16F,pd,64*pd,I.qv,CUDA_R_16F,pd,64*pd,&z,I.scv,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  Softmax<half_t>(N*64,64,I.scv,I.scv,(half_t*)nullptr,0);
+  // vout(N,64,3) = scv(64x64) . vv(64x3), per position (see .cu notes for the layout)
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,3,64,64,&o,I.vvh,CUDA_R_16F,3,64*3,I.scv,CUDA_R_16F,64,64*64,&z,I.vout,CUDA_R_16F,3,64*3,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  k_wdl_mean<<<N,3>>>(I.d_wdl,I.vout,N);
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(policy_out,I.d_pol,(size_t)N*1858*sizeof(float),cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(wdl_out,I.d_wdl,(size_t)N*3*sizeof(float),cudaMemcpyDeviceToHost));
 }
 
 }  // namespace hero
