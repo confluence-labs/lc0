@@ -101,11 +101,15 @@ int main(int argc, char** argv) {
   half_t *eu=upload(w.embed_up_w,scratch), *edn=upload(w.embed_down_w,scratch), *efln=upload(w.embed_ffn_ln_g,scratch);
   std::vector<float> zeros(d,0.f); half_t* zbuf=upload(zeros,scratch);
 
-  // planes on device as (N,64,112) half, and its 12-plane flatten (N,768)
-  std::vector<float> flat12(N*768);
+  // oracle planes are NHWC (N,64,112); the concat kernel wants NCHW (N,112,64).
+  std::vector<float> planes_nchw((size_t)N*112*64);
+  for (int n=0;n<N;n++) for (int hw=0;hw<64;hw++) for (int c=0;c<112;c++)
+    planes_nchw[(size_t)n*112*64 + c*64 + hw] = planes[(size_t)n*64*112 + hw*112 + c];
+  // preproc input: x[:,:,:12].reshape(N,768), square-major [sq0_ch0..11, sq1_...]
+  std::vector<float> flat12((size_t)N*768);
   for (int n=0;n<N;n++) for (int s=0;s<64;s++) for (int c=0;c<12;c++)
-    flat12[n*768 + s*12 + c] = planes[(size_t)n*64*112 + s*112 + c];
-  half_t *dPlanes=upload(planes,scratch), *dFlat=upload(flat12,scratch);
+    flat12[(size_t)n*768 + s*12 + c] = planes[(size_t)n*64*112 + s*112 + c];
+  half_t *dPlanes=upload(planes_nchw,scratch), *dFlat=upload(flat12,scratch);
 
   // buffers
   half_t *pos128, *pos8192, *cat240, *emb_d, *e_out, *up_h, *dn_h, *x_out;
@@ -135,6 +139,17 @@ int main(int argc, char** argv) {
   float alpha = powf(2.f * w.layers, -0.25f);
   LayerNorm<half_t>(N*64, d, x_out, dn_h, zbuf, e_out, efln, zbuf, 1e-3f, alpha, ACTIVATION_NONE, 0);
   CK(cudaDeviceSynchronize());
+
+  // per-stage diagnostics (localize any NaN/divergence)
+  auto dbg = [&](const char* nm, half_t* p, size_t cnt){
+    std::vector<half_t> h(cnt); cudaMemcpy(h.data(), p, cnt*sizeof(half_t), cudaMemcpyDeviceToHost);
+    double mx=0; int nan=0; for (auto v: h){ float f=__half2float(v); if(f!=f)nan++; mx=fmax(mx,fabs((double)f)); }
+    printf("  [%s] max|.|=%.3f nans=%d first=%.4f\n", nm, mx, nan, __half2float(h[0]));
+  };
+  dbg("pos128", pos128, (size_t)N*128);
+  dbg("cat240", cat240, (size_t)N*64*240);
+  dbg("e_out(LNmish)", e_out, (size_t)N*64*d);
+  dbg("x_out", x_out, (size_t)N*64*d);
 
   // compare
   std::vector<half_t> hout(N*64*d); CK(cudaMemcpy(hout.data(), x_out, hout.size()*sizeof(half_t), cudaMemcpyDeviceToHost));
