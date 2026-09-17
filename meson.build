@@ -138,7 +138,6 @@ common_files += [
   'src/neural/factory.cc',
   'src/neural/loader.cc',
   'src/neural/hero/hero_weights.cc',
-  'src/neural/hero/network_hero.cc',
   'src/neural/register.cc',
   'src/neural/shared_params.cc',
   'src/neural/wrapper.cc',
@@ -595,6 +594,14 @@ if get_option('build_backends')
         output : outputname,
         command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
       )
+      # Hero backend: device forward (fusedMHA) + host registration. Gated with
+      # CUTLASS because the forward uses fusedMHA; host reg links against it.
+      cuda_files += custom_target('hero forward',
+        input : 'src/neural/hero/hero_forward.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+      )
+      cuda_files += 'src/neural/hero/network_hero.cc'
     endif
 
     cuda_files += custom_target('cuda fp32 code',
