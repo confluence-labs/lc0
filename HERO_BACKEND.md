@@ -34,9 +34,28 @@ third_party`, compile `cutlass_kernels.cu`+`common_kernels.cu`+`fp16_kernels.cu`
 | 1024 | 5258   | **10508**        | 0.445 | 57/43    |
 
 2.0x at B=1024 (vs BT4 13825 nps = 76%). Throughput still climbing at B=1024.
-NEXT: PRIORITY 2 = FFN is now the co-bottleneck (43%) — 13 sequential per-expert
-cuBLAS gemms. CUTLASS 2.x grouped GEMM (SM80) is the remaining lever. Also sweep
-B up (2048/4096) to find the throughput ceiling — a bigger batch may clear BT4.
+
+**BATCH SWEEP (2026-09-17):** plateaus at ~10.7k pos/s — B=1024→10516, 2048→10579,
+4096→10692, 8192→10706 (MFU 0.445→0.453). Batch is NOT the lever; compute-bound
+at ~45% MFU. attn/ffn ~56/44. A bigger leaf batch will NOT clear BT4.
+
+**fusedMHA NUMERICALLY VALIDATED (2026-09-17):** ran the full forward gate with
+the USE_CUTLASS attention path vs the torch oracle (N=8). TRUNK PASS (worst_rel
+0.0234 < 6e-2, mean 0.00163), VALUE PASS. POLICY top1 7/8, top3 8/8, mean_rel
+8.6e-4 — the one top1 miss is fp16 rounding on a near-tie (fused kernel's accum
+order differs from host cuBLAS), NOT a bug; correct move is top-3 for all 8. The
+engine runs fp16 anyway, so this IS target precision. Fast attention path is GO.
+
+**BASELINE METHODOLOGY FIX:** the 13825 is BT4 *engine* nps (lc0 benchmark, incl.
+MCTS search); Hero's 10.7k is *trunk-only forward* throughput — not comparable.
+Apples-to-apples = lc0 `backendbench` (forward-only) for BT4 on the same A100;
+that run is measuring now (first attempt's in-script grep discarded the numbers
+— output format has no 'nps' literal — re-running with raw capture).
+
+NEXT: PRIORITY 2 = FFN co-bottleneck (44%) — 13 sequential per-expert cuBLAS
+gemms; CUTLASS 2.x grouped GEMM (SM80) is the lever, and gets URGENT if the
+45-class/top-k routing lands (up to ~180 gemms/layer). Then wire the validated
+forward into network_hero ComputeBlocking so --backend=hero plays.
 
 ## Target hardware: A100 (CCC parity) — Ampere SM80
 
