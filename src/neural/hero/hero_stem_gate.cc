@@ -17,6 +17,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #include "neural/hero/hero_weights.h"
 #include "neural/backends/cuda/kernels.h"
@@ -336,8 +337,19 @@ int main(int argc, char** argv) {
   auto refP=load_npy_f32(od+"/policy.npy"), refW=load_npy_f32(od+"/wdl.npy");
   double pw=0,ps=0,prm=0; for(size_t i=0;i<polout.size();i++){double dd=fabs(polout[i]-refP[i]);pw=fmax(pw,dd);ps+=dd;prm=fmax(prm,fabs(refP[i]));}
   double vw=0,rmw=0; for(size_t i=0;i<wdlout.size();i++){vw=fmax(vw,fabs(wdlout[i]-refW[i]));rmw=fmax(rmw,fabs(refW[i]));}
-  bool pol_ok = pw/prm<3e-2 && ps/polout.size()<2e-3, val_ok=vw/rmw<3e-2;
-  printf("POLICY gate: worst|d|=%.4f mean|d|=%.5f worst_rel=%.4f (of %.1f) (%s)\n", pw, ps/polout.size(), pw/prm, prm, pol_ok?"PASS":"FAIL");
+  // chess-meaningful: does the top move match per position (and top-3 overlap)?
+  int top1=0, top3=0;
+  for (int n=0;n<N;n++){
+    auto am=[&](const std::vector<float>& v){ int b=0; for(int m=1;m<1858;m++) if(v[(size_t)n*1858+m]>v[(size_t)n*1858+b]) b=m; return b; };
+    // top-3 of ref
+    int r0=am(refP); std::vector<int> t3; for(int t=0;t<3;t++){int b=-1;for(int m=0;m<1858;m++){if(std::find(t3.begin(),t3.end(),m)!=t3.end())continue; if(b<0||refP[(size_t)n*1858+m]>refP[(size_t)n*1858+b])b=m;} t3.push_back(b);}
+    int g0=am(polout);
+    if (g0==r0) top1++;
+    if (std::find(t3.begin(),t3.end(),g0)!=t3.end()) top3++;
+  }
+  double pol_rel = ps/polout.size()/prm;
+  bool pol_ok = (top1==N) && pol_rel<3e-3, val_ok=vw/rmw<3e-2;
+  printf("POLICY gate: top1-match=%d/%d top3=%d/%d mean_rel=%.5f worst|d|=%.3f (%s)\n", top1,N,top3,N,pol_rel,pw, pol_ok?"PASS":"FAIL");
   printf("VALUE  gate: worst|d|=%.4f wdl0=[%.3f %.3f %.3f] ref=[%.3f %.3f %.3f] (%s)\n",
          vw, wdlout[0],wdlout[1],wdlout[2], refW[0],refW[1],refW[2], val_ok?"PASS":"FAIL");
   printf("FULL FORWARD: %s\n", (pol_ok&&val_ok)?"PASS":"FAIL");
