@@ -72,12 +72,18 @@ int main(int argc,char** argv){
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,qw,d,xin,d,0.f,qd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,kw,d,xin,d,0.f,kd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,vw,d,xin,d,0.f,vd,d);
+#ifdef USE_CUTLASS
+    // fused flash attention: q/k/v (N,64,d) interleaved in, +bias(B,H,64,64),
+    // scale+softmax+av fused, out (N,64,d) — no transposes, no batched gemms.
+    fusedMHA<half_t>(po, qd, kd, vd, bias, B, H, hd, 0);
+#else
     k_toheads<<<th,hd>>>(qt,qd,H,hd); k_toheads<<<th,hd>>>(kt,kd,H,hd); k_toheads<<<th,hd>>>(vt,vd,H,hd);
     float z=0,o=1;
     CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,hd,&fac,kt,CUDA_R_16F,hd,64*hd,qt,CUDA_R_16F,hd,64*hd,&z,sc,CUDA_R_16F,64,64*64,B*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     Softmax<half_t>(B*H*64,64,sc,sc,bias,0);
     CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,hd,64,64,&o,vt,CUDA_R_16F,hd,64*hd,sc,CUDA_R_16F,64,64*64,&z,ctx,CUDA_R_16F,hd,64*hd,B*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     k_fromheads<<<th,hd>>>(po,ctx,H,hd);
+#endif
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,ow,d,po,d,0.f,attn,d);
     LayerNorm<half_t>(R,d,xa,attn,zb,xin,l1,zb,1e-3f,al,ACTIVATION_NONE,0);
     cudaEventRecord(eb);
