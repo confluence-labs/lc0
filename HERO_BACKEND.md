@@ -113,7 +113,8 @@ buffer for LN bias/beta; eps 1e-3):
    `LayerNorm(..., bias=0, skip=x, embed_ffn_ln_g, beta=0, 1e-3, alpha=(2L)^-0.25,
    act=NONE)` == normalize(x + alpha*down).
 
-Gate 3a: dump this stem output, compare to `hero/oracle/post_stem.npy` (1e-2).
+Gate 3a: DONE (2026-09-17) — stem reproduces the oracle, mean|d| 0.00013,
+worst 0.1% rel (fp16-vs-fp32). Whole stem->lc0-kernel mapping validated.
 Same LN identity powers the encoder LN1 (act=MISH) / LN2 (DeepNorm skip) and
 value/policy head mishes — so the whole non-FFN path reuses lc0 kernels; only
 static-bias + expert-FFN are genuinely new.
