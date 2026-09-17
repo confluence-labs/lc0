@@ -124,7 +124,9 @@ static-bias + expert-FFN are genuinely new.
   mean|d| ~2e-4). The novel routed FFN — Hero's raison d'etre — is validated
   (cuBLAS-loop; CUTLASS is INC4). geo_basis() ported to C++. Gate:
   `src/neural/hero/hero_stem_gate.cc` (stem->attn->layer0 staged vs oracle npy).
-- **INC3d (next)** — loop all 15 layers + policy/value heads -> policy/wdl,
+- **INC3d TRUNK DONE (2026-09-17)** — all 15 layers loop, trunk reproduces the
+  oracle (mean|d| 0.00185 over 15 fp16 layers). Only the 2 heads remain.
+- **INC3d heads (next)** — policy/value heads -> policy/wdl,
   gate vs oracle policy.npy/wdl.npy. Then wire into network_hero's ComputeBlocking.
 - **INC3 (superseded framing)** — fork lc0's `CudaNetwork`
   run stem + attention (static bias) + heads with a **cuBLAS-loop FFN** (slow,
