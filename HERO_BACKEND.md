@@ -136,7 +136,12 @@ static-bias + expert-FFN are genuinely new.
   `src/neural/hero/hero_stem_gate.cc` (stem->attn->layer0 staged vs oracle npy).
 - **INC3d TRUNK DONE (2026-09-17)** — all 15 layers loop, trunk reproduces the
   oracle (mean|d| 0.00185 over 15 fp16 layers). Only the 2 heads remain.
-- **INC3d heads (next)** — policy/value heads -> policy/wdl,
+- **INC3 CORRECTNESS COMPLETE (2026-09-17)** — FULL FORWARD PASS: stem + 15
+  layers (attn + routed FFN) + policy + value reproduce the oracle; top-1 move
+  match 8/8, top-3 8/8, value fp16-exact. The whole Hero net runs correctly in
+  CUDA (`hero_stem_gate.cc`). Next: wire into network_hero ComputeBlocking
+  (loop+heads on device), then INC4 (Ampere FFN kernel) + nps on A100.
+- (was) INC3d heads — policy/value heads -> policy/wdl,
   gate vs oracle policy.npy/wdl.npy. Then wire into network_hero's ComputeBlocking.
 - **INC3 (superseded framing)** — fork lc0's `CudaNetwork`
   run stem + attention (static bias) + heads with a **cuBLAS-loop FFN** (slow,
