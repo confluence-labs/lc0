@@ -42,8 +42,8 @@ class HeroNetworkComputation : public NetworkComputation {
 
 class HeroNetwork : public Network {
  public:
-  HeroNetwork(const std::string& path, const OptionsDict& /*options*/)
-      : weights_(hero::LoadHeroWeights(path)), forward_(weights_) {
+  HeroNetwork(const std::string& path, int gpu)
+      : weights_(hero::LoadHeroWeights(path)), forward_(weights_, gpu) {
     capabilities_.input_format =
         pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION_V2;
     capabilities_.output_format = pblczero::NetworkFormat::OUTPUT_WDL;
@@ -118,7 +118,7 @@ std::unique_ptr<Network> MakeHeroNetwork(const std::optional<WeightsFile>& /*w*/
   if (path.empty() || !hero::IsHeroWeightsFile(path)) {
     throw Exception("The hero backend requires a .htw weights file.");
   }
-  return std::make_unique<HeroNetwork>(path, options);
+  return std::make_unique<HeroNetwork>(path, options.GetOrDefault<int>("gpu", 0));
 }
 
 REGISTER_NETWORK("hero", MakeHeroNetwork, 50)

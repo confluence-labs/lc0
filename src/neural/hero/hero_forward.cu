@@ -168,7 +168,9 @@ struct HeroForward::Impl {
   int *dOrder,*dRoute;        // per-row (sized to batch)
   int *dCnt,*dCursor,*dOff;   // per-expert (E), allocated once
 
-  Impl(const HeroWeights& wt) : w(wt) {
+  int device = 0;              // GPU id (multi-GPU: multiplexing gives gpu=0/1/...)
+  Impl(const HeroWeights& wt, int gpu) : w(wt), device(gpu) {
+    CK(cudaSetDevice(device));
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
     alpha = powf(2.f*L, -0.25f);
     CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH));
@@ -247,12 +249,12 @@ struct HeroForward::Impl {
 };
 
 // ---------------------------- public entry points ----------------------------
-HeroForward::HeroForward(const HeroWeights& w) : p_(new Impl(w)) {}
+HeroForward::HeroForward(const HeroWeights& w, int gpu) : p_(new Impl(w, gpu)) {}
 HeroForward::~HeroForward() { delete p_; }
 
 void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
                       const std::vector<int>& gather, float* policy_out, float* wdl_out) {
-  Impl& I=*p_; std::lock_guard<std::mutex> lk(I.mtx); I.ensure(N); cublasHandle_t cub=I.cub;
+  Impl& I=*p_; std::lock_guard<std::mutex> lk(I.mtx); CK(cudaSetDevice(I.device)); I.ensure(N); cublasHandle_t cub=I.cub;
   const int d=I.d,H=I.H,hd=I.hd,dff=I.dff,E=I.E,ed=I.ed,pd=I.pd; const float al=I.alpha;
   const size_t T=(size_t)N*64*d; const int R=N*64;
 

@@ -11,7 +11,7 @@ struct HeroWeights;
 
 class HeroForward {
  public:
-  explicit HeroForward(const HeroWeights& w);
+  explicit HeroForward(const HeroWeights& w, int gpu = 0);
   ~HeroForward();
   HeroForward(const HeroForward&) = delete;
   HeroForward& operator=(const HeroForward&) = delete;
