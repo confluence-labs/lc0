@@ -258,6 +258,13 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   const int d=I.d,H=I.H,hd=I.hd,dff=I.dff,E=I.E,ed=I.ed,pd=I.pd; const float al=I.alpha;
   const size_t T=(size_t)N*64*d; const int R=N*64;
 
+  // ---- optional phase profiling (HERO_PROFILE=1): stem/route/trunk/heads ----
+  static const bool prof = getenv("HERO_PROFILE") != nullptr;
+  static cudaEvent_t E0=0,Es=0,Er=0,Et=0,Eh=0;
+  static double a_stem=0,a_route=0,a_trunk=0,a_heads=0; static long prof_calls=0;
+  if (prof && !E0){ cudaEventCreate(&E0);cudaEventCreate(&Es);cudaEventCreate(&Er);cudaEventCreate(&Et);cudaEventCreate(&Eh); }
+  if (prof) cudaEventRecord(E0,0);
+
   { // upload planes (fp32 -> fp16) via copyTypeConverted
     float* tmp; CK(cudaMalloc(&tmp,(size_t)N*112*64*sizeof(float)));
     CK(cudaMemcpy(tmp,planes_nchw,(size_t)N*112*64*sizeof(float),cudaMemcpyHostToDevice));
@@ -278,21 +285,15 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,ed,1.f,I.edn,ed,I.up_h,ed,0.f,I.dn_h,d);
   LayerNorm<half_t>(R,d,I.x,I.dn_h,I.zbuf,I.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
 
+  if (prof) cudaEventRecord(Es,0);   // stem done
   // ---- route (class-count-aware) + host sort -> order/offsets ----
-  // HERO_PROFILE=1 -> time the pure-host route+sort (prime bottleneck suspect)
-  static const bool prof = getenv("HERO_PROFILE") != nullptr;
-  static double acc_route_ms = 0; static long prof_calls = 0;
-  std::chrono::steady_clock::time_point _r0;
-  if (prof) { CK(cudaDeviceSynchronize()); _r0 = std::chrono::steady_clock::now(); }
   std::vector<int> route; I.route(planes_nchw,N,route);
   std::vector<int> order(R), off(E+1,0), cnt(E,0);
   for (int r=0;r<R;r++) cnt[route[r]]++;
   for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
   { std::vector<int> cur(off.begin(),off.end()-1); for(int r=0;r<R;r++) order[cur[route[r]]++]=r; }
   CK(cudaMemcpy(I.dOrder,order.data(),R*sizeof(int),cudaMemcpyHostToDevice));
-  if (prof) { auto _r1=std::chrono::steady_clock::now();
-    acc_route_ms += std::chrono::duration<double,std::milli>(_r1-_r0).count();
-    if (++prof_calls % 50 == 0) fprintf(stderr,"HEROPROF N=%d route+sort avg = %.2f ms/call over %ld calls\n", N, acc_route_ms/prof_calls, prof_calls); }
+  if (prof) cudaEventRecord(Er,0);   // route (host stall + dOrder upload) done
 
   // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
   dim3 gd(R,(d+255)/256);
@@ -315,6 +316,7 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
   }
+  if (prof) cudaEventRecord(Et,0);   // trunk done
 
   // ---- heads (fully device-resident) ----
   if (!I.dGather) { CK(cudaMalloc(&I.dGather,1858*sizeof(int)));
@@ -337,7 +339,13 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   // vout(N,64,3) = scv(64x64) . vv(64x3), per position (see .cu notes for the layout)
   CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,3,64,64,&o,I.vvh,CUDA_R_16F,3,64*3,I.scv,CUDA_R_16F,64,64*64,&z,I.vout,CUDA_R_16F,3,64*3,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
   k_wdl_mean<<<N,3>>>(I.d_wdl,I.vout,N);
+  if (prof) cudaEventRecord(Eh,0);   // heads done
   CK(cudaDeviceSynchronize());
+  if (prof) { float ms; long c=++prof_calls;
+    cudaEventElapsedTime(&ms,E0,Es); a_stem+=ms;  cudaEventElapsedTime(&ms,Es,Er); a_route+=ms;
+    cudaEventElapsedTime(&ms,Er,Et); a_trunk+=ms; cudaEventElapsedTime(&ms,Et,Eh); a_heads+=ms;
+    if (c%50==0) fprintf(stderr,"HEROPROF N=%d/50-avg: stem %.2f | route %.2f | trunk %.2f | heads %.2f ms (sum %.1f)\n",
+      N, a_stem/c, a_route/c, a_trunk/c, a_heads/c, (a_stem+a_route+a_trunk+a_heads)/c); }
   CK(cudaMemcpy(policy_out,I.d_pol,(size_t)N*1858*sizeof(float),cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(wdl_out,I.d_wdl,(size_t)N*3*sizeof(float),cudaMemcpyDeviceToHost));
 }
