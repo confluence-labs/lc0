@@ -206,10 +206,32 @@ wins where it counts. Hero also runs bs>=2048 (to 12288) where BT4 OOMs on 40GB.
 
 DAY ARC: no backend -> fusedMHA (2x) -> device heads (56->7344) -> engine tuning
 -> multi-stream FFN -> broadcast-bias -> HERO > BT4. int8 ruled out (1.3x).
-REMAINING (optional, extends the lead): device route13 kernel — hero still sags
-past bs1024 (host argmax stops overlapping the stem); fixing it holds ~8.8k into
-the bs2048-12288 regime BT4 can't enter. The claim (Elo at TC) is the CCC harness;
-backend is now FASTER than BT4 and ready for it.
+
+**DEVICE ROUTING (commit 03cfe3e) — built, correct, but did NOT fix large-batch
+scaling.** Moved route13/hist/offsets/order to GPU kernels (only off[] returns to
+host). Correct (b4f4). Measured on a LAMBDA A100 (GCP was stocked out — Niranjan's
+training took the A100s; Lambda 1x a100_sxm4 $1.99/hr):
+
+| batch | Lambda A100 post-devroute |
+|-------|---------------------------|
+| 512   | 9,572 |
+| 1024  | 9,843 (peak) |
+| 2048  | 8,459 |
+| 4096  | 8,373 |
+| 8192  | 8,047 |
+
+HONEST: (1) degradation past bs1024 PERSISTS (9843->8459) despite device routing
+-> the large-batch bottleneck is NOT host routing, it's MEMORY BANDWIDTH (activs
+exceed cache) — a fundamental limit, not a fixable overhead. (2) Lambda's A100
+clocks higher than GCP's, so these aren't same-silicon comparable to the 8797 GCP
+peak — can't isolate device-routing's delta without a same-box A/B.
+
+CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there); "unlimited batch" does
+NOT yield more throughput (peaks at 1024, declines after, bandwidth-bound). Large
+batch = "hero CAN run where BT4 OOMs", not "hero faster there". Device routing is
+sound hygiene (kept), not a new win. THE speed headline stands: hero > BT4 at the
+operating batch (bs512-1024), same-box confirmed. Backend work is DONE; claim =
+Elo at TC via CCC harness.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
