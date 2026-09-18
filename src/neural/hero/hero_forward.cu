@@ -52,6 +52,20 @@ static half_t* up_f(const std::vector<float>& v) {  // upload fp32 -> fp16 devic
   CK(cudaDeviceSynchronize()); CK(cudaFree(tmp));
   return d;
 }
+// quantize [outC,inC] row-major fp32 weights -> int8 device (per-out-channel) + inv[outC]=amax/127
+static void quant_chan(const float* w, size_t outC, int inC, int8_t** d_i8, float** d_inv) {
+  std::vector<int8_t> q(outC*inC); std::vector<float> inv(outC);
+  for (size_t o=0;o<outC;o++){ float mx=0; const float* wr=w+o*inC; for(int j=0;j<inC;j++) mx=fmaxf(mx,fabsf(wr[j]));
+    float sc=mx>0?127.f/mx:0.f; inv[o]=mx>0?mx/127.f:0.f;
+    for(int j=0;j<inC;j++){ int v=(int)lrintf(wr[j]*sc); q[o*inC+j]=(int8_t)(v>127?127:v<-127?-127:v); } }
+  CK(cudaMalloc(d_i8,outC*inC)); CK(cudaMemcpy(*d_i8,q.data(),outC*inC,cudaMemcpyHostToDevice));
+  CK(cudaMalloc(d_inv,outC*sizeof(float))); CK(cudaMemcpy(*d_inv,inv.data(),outC*sizeof(float),cudaMemcpyHostToDevice));
+}
+// int8 gemm: C[m,n] int32 = op_T(A_i8[k,m]) * op_N(B_i8[k,n]), int32 accumulate (TN format)
+static void gemm_i8(cublasHandle_t h,int m,int n,int k,const int8_t* A,int lda,const int8_t* B,int ldb,int32_t* C,int ldc){
+  int32_t a=1,b=0;
+  CB(cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,m,n,k,&a,A,CUDA_R_8I,lda,B,CUDA_R_8I,ldb,&b,C,CUDA_R_32I,ldc,CUBLAS_COMPUTE_32I,CUBLAS_GEMM_DEFAULT));
+}
 
 static std::vector<std::vector<float>> geo_basis() {
   std::vector<std::vector<float>> g(18, std::vector<float>(4096));
@@ -139,6 +153,28 @@ __global__ void k_route_id(const uint8_t* piece,const uint8_t* att_o,const uint8
 __global__ void k_hist(const int* route,int* cnt,int R){ int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R) atomicAdd(&cnt[route[r]],1); }
 __global__ void k_scatter_order(const int* route,int* cur,int* order,int R){ int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R){ int p=atomicAdd(&cur[route[r]],1); order[p]=r; } }
 
+// ---- int8 quantization helpers (INC int8-A: FFN gemms) ----
+// per-row dynamic quant of a [rows,K] fp16 matrix -> int8 + per-row inv-scale (amax/127)
+__global__ void k_quant_rows(const half_t* x, int8_t* xq, float* ainv, int rows, int K){
+  int r=blockIdx.x; if(r>=rows) return;
+  const half_t* xr=x+(size_t)r*K; int8_t* qr=xq+(size_t)r*K;
+  __shared__ float sm[256]; float amax=0;
+  for(int j=threadIdx.x;j<K;j+=blockDim.x) amax=fmaxf(amax,fabsf(__half2float(xr[j])));
+  sm[threadIdx.x]=amax; __syncthreads();
+  for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s) sm[threadIdx.x]=fmaxf(sm[threadIdx.x],sm[threadIdx.x+s]); __syncthreads(); }
+  float mx=sm[0]; float sc = mx>0? 127.f/mx : 0.f;
+  if(threadIdx.x==0) ainv[r] = mx>0? mx/127.f : 0.f;
+  for(int j=threadIdx.x;j<K;j+=blockDim.x){ int v=__float2int_rn(__half2float(xr[j])*sc); qr[j]=(int8_t)max(-127,min(127,v)); }
+}
+// dequant int32 gemm output C[out,rows] (col-major, ld=out) with per-out-channel wcol_inv
+// and per-row ainv; optional mish. writes fp16 in the same [out,rows] layout.
+__global__ void k_dequant(const int32_t* c, half_t* out, const float* wcol_inv, const float* ainv, int outC, int rows, int mish){
+  int o=blockIdx.x*blockDim.x+threadIdx.x, r=blockIdx.y; if(o>=outC) return;
+  size_t idx=(size_t)r*outC+o; float v=(float)c[idx]*wcol_inv[o]*ainv[r];
+  if(mish){ float sp = v>20.f? v : logf(1.f+expf(v)); v = v*tanhf(sp); }
+  out[idx]=__float2half(v);
+}
+
 // ============================ the forward object ============================
 struct HeroForward::Impl {
   HeroWeights w;               // host weights kept only for head-side host math
@@ -149,10 +185,12 @@ struct HeroForward::Impl {
   int d, L, H, hd, dff, E, ed, pd;
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
+  const bool int8 = getenv("HERO_INT8") != nullptr;   // INC int8-A: int8 FFN gemms
 
   // ---- weights (device, uploaded once) ----
   half_t *pp0,*pp1,*emb,*eln,*eu,*edn,*efln,*zbuf;
-  struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias; };  // bias: (H,64,64) fp16
+  struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias;   // bias: (H,64,64) fp16
+              int8_t *up_i8=nullptr,*dn_i8=nullptr; float *up_inv=nullptr,*dn_inv=nullptr; };
   std::vector<LW> lw;
   // head weights (device, uploaded once) + policy-promotion + gather map
   half_t *h_pe,*h_peb,*h_pq,*h_pqb,*h_pk,*h_pkb,*h_ve,*h_vq,*h_vk,*h_vv,*h_ppo;
@@ -167,6 +205,8 @@ struct HeroForward::Impl {
   int *dOrder;
   // device-route scratch
   uint8_t *dOcc,*dPiece,*dAtt_o,*dAtt_t; int *dRoute,*dCnt,*dCur;
+  // int8 FFN scratch (allocated only when int8)
+  int8_t *xs_i8=nullptr,*gh_i8=nullptr; int32_t *ffgh_i32=nullptr,*ys_i32=nullptr; float *xrow_inv=nullptr,*ghrow_inv=nullptr;
 
   Impl(const HeroWeights& wt) : w(wt) {
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
@@ -180,7 +220,12 @@ struct HeroForward::Impl {
     for (int li=0; li<L; li++) {
       auto& s=w.layer[li]; auto& t=lw[li];
       t.qw=up_f(s.q_w); t.kw=up_f(s.k_w); t.vw=up_f(s.v_w); t.ow=up_f(s.out_w);
-      t.l1g=up_f(s.ln1_g); t.l2g=up_f(s.ln2_g); t.up=up_f(s.ffn_up); t.dn=up_f(s.ffn_down);
+      t.l1g=up_f(s.ln1_g); t.l2g=up_f(s.ln2_g);
+      if (int8) {  // per-output-channel int8 for the whole expert bank; free the fp16 copies
+        quant_chan(s.ffn_up.data(),   (size_t)E*dff, d,   &t.up_i8, &t.up_inv);
+        quant_chan(s.ffn_down.data(), (size_t)E*d,   dff, &t.dn_i8, &t.dn_inv);
+        t.up=t.dn=nullptr;
+      } else { t.up=up_f(s.ffn_up); t.dn=up_f(s.ffn_down); }
       std::vector<float> bias_hhh((size_t)H*64*64, 0.f);   // free + alpha_mix . geo (once)
       for (int h=0;h<H;h++) for (int i=0;i<64;i++) for (int j=0;j<64;j++){
         double b=s.free[(size_t)h*64*64+i*64+j];
@@ -219,6 +264,10 @@ struct HeroForward::Impl {
     CK(cudaMalloc(&dOcc,R)); CK(cudaMalloc(&dPiece,R)); CK(cudaMalloc(&dAtt_o,R)); CK(cudaMalloc(&dAtt_t,R));
     CK(cudaMalloc(&dRoute,R*sizeof(int)));
     if (!capN) { CK(cudaMalloc(&dCnt,(E+1)*sizeof(int))); CK(cudaMalloc(&dCur,E*sizeof(int))); }
+    if (int8) { if(capN){ cudaFree(xs_i8);cudaFree(gh_i8);cudaFree(ffgh_i32);cudaFree(ys_i32);cudaFree(xrow_inv);cudaFree(ghrow_inv); }
+      CK(cudaMalloc(&xs_i8,R*(size_t)d)); CK(cudaMalloc(&gh_i8,R*(size_t)dff));
+      CK(cudaMalloc(&ffgh_i32,R*(size_t)dff*sizeof(int32_t))); CK(cudaMalloc(&ys_i32,R*(size_t)d*sizeof(int32_t)));
+      CK(cudaMalloc(&xrow_inv,R*sizeof(float))); CK(cudaMalloc(&ghrow_inv,R*sizeof(float))); }
     capN = N;
   }
 
@@ -360,10 +409,20 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
-    for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
-      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
-      addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,0);
-      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
+    if (I.int8) {   // int8 expert gemms: quant -> int8 gemm (int32 acc) -> dequant(+mish)
+      k_quant_rows<<<R,256>>>(I.xs,I.xs_i8,I.xrow_inv,R,d);
+      for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue; size_t oo=off[e];
+        gemm_i8(cub,dff,m,d, t.up_i8+(size_t)e*dff*d,d, I.xs_i8+oo*d,d, I.ffgh_i32+oo*dff,dff);
+        k_dequant<<<dim3((dff+255)/256,m),256>>>(I.ffgh_i32+oo*dff,I.ffgh+oo*dff,t.up_inv+(size_t)e*dff,I.xrow_inv+oo,dff,m,1);
+        k_quant_rows<<<m,256>>>(I.ffgh+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,m,dff);
+        gemm_i8(cub,d,m,dff, t.dn_i8+(size_t)e*d*dff,dff, I.gh_i8+oo*dff,dff, I.ys_i32+oo*d,d);
+        k_dequant<<<dim3((d+255)/256,m),256>>>(I.ys_i32+oo*d,I.ys+oo*d,t.dn_inv+(size_t)e*d,I.ghrow_inv+oo,d,m,0); }
+    } else {
+      for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
+        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
+        addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,0);
+        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
+    }
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
   }
