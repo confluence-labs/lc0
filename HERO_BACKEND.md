@@ -283,6 +283,20 @@ inference. Pipelined eval KEPT (default SLOTS=3): small win + the right
 architecture for multi-GPU concurrency. Note: SLOTS=3 sizes 3x scratch, fine at
 engine minibatch (<=384); use SLOTS=1 for backendbench at huge batch (OOM guard).
 
+**STEADY-STATE UTIL — CORRECTS the "67% / MCTS-bound" read.** Fixed the broken
+single-position test (keep stdin open so `go movetime 40000` runs its full 40s).
+ONE big persistent tree (like a real game), util over time: 0-5s 0% (warmup),
+5-10s 44%, 10-20s **99%**, 20-40s **99%**. So in STEADY STATE the GPU is 99%
+utilized — NOT MCTS-bound. The earlier 67% was a BENCHMARK ARTIFACT: the benchmark
+runs many SHORT searches (fresh tree each position), so the ~10s warmup dragged
+the average down. Real games build one persistent tree (lc0 reuses across moves)
+-> GPU pegged ~99% after the opening. IMPLICATIONS: (1) the search FEEDS the GPU
+fully in real play — no engine-fill gap to recover, MCTS is NOT the bottleneck;
+(2) the forward speed IS the real-game throughput (~8.85k/A100, ~17.6k on 2xA100);
+(3) explains why pipelining only gave +4.5% (nothing to overlap at 99%). Retract
+the "MCTS-bound" framing. "Faster" = more/faster GPUs or smaller net; the backend
+is maxed AND fully utilized.
+
 CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there). Large batch declines but
 hero STILL runs there at ~8k where BT4 OOMs (zero) — so hero wins at EVERY batch:
 faster at bs512-1024, only-option at bs2048+. Cause of the decline is academic to
