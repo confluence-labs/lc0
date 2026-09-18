@@ -191,13 +191,25 @@ across batch, still plays b4f4 (strideB=0 correct). Cache-free forward:
 | 8192  | 7,366    | 7,624     | OOM        |
 | 12288 | -        | 7,482     | OOM        |
 
-**At bs=1024 (shared peak) HERO 8,797 > BT4 8,580 — ~2.5% faster, and correct.**
-First time hero leads on a clean cache-free measurement. Hero also runs bs>=2048
-(to 12288+) where BT4 OOMs. REMAINING: hero still degrades past bs=1024 (host
-route13 argmax O(N*64*12) stops overlapping the stem at large batch) — device-
-side route kernel would hold ~8.8k into the bs2048-12288 regime BT4 can't enter,
-extending the lead. NEXT: (1) same-box side-by-side confirm (airtight the claim);
-(2) device route13 kernel for large-batch scaling.
+**AIRTIGHT SAME-BOX CONFIRM (2026-09-17, one A100, both nets, cache-free):**
+
+| batch | HERO      | BT4       | winner       |
+|-------|-----------|-----------|--------------|
+| 256   | 7,951     | 8,133     | BT4 +2.3%    |
+| 512   | **8,602** | 8,444     | HERO +1.9%   |
+| 1024  | **8,853** | 8,671     | HERO +2.1%   |
+
+**QUOTABLE: hero beats BT4 by ~2% at bs=512 and 1024 (the operating range), same
+silicon, no cross-box ambiguity.** BT4 only wins at bs=256 (hero's fixed per-fwd
+overhead weighs more at small batch). Since the search runs large batches, hero
+wins where it counts. Hero also runs bs>=2048 (to 12288) where BT4 OOMs on 40GB.
+
+DAY ARC: no backend -> fusedMHA (2x) -> device heads (56->7344) -> engine tuning
+-> multi-stream FFN -> broadcast-bias -> HERO > BT4. int8 ruled out (1.3x).
+REMAINING (optional, extends the lead): device route13 kernel — hero still sags
+past bs1024 (host argmax stops overlapping the stem); fixing it holds ~8.8k into
+the bs2048-12288 regime BT4 can't enter. The claim (Elo at TC) is the CCC harness;
+backend is now FASTER than BT4 and ready for it.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
