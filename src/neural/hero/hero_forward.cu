@@ -1,20 +1,17 @@
 // Hero device-resident forward for the `-hero` backend (see HERO_BACKEND.md).
-// Merges the two validated references: hero_stem_gate.cc (real weights, stem,
-// policy/value heads, oracle-gated) and hero_bench_cuda.cu (device trunk with
-// fusedMHA + gather/scatter expert FFN). ALL weights + scratch buffers upload
-// ONCE at construction; Run() does one batched forward with NO host allocs and
-// NO per-call weight uploads (the correct-first version re-did that every call
-// and ran at ~46 nps — this is the perf pass).
-//
-// The trunk (~99% of compute) is fully device-resident with the validated
-// fusedMHA attention. Routing (13-class = piece type) is host-side per batch
-// (tiny) and the small attention-style heads run host-side on downloaded q/k
-// (the validated math) — moved to device only if measured to bottleneck.
+// Weights upload ONCE at construction and are SHARED (read-only). Per-forward
+// scratch lives in a POOL of Ctx (each with its own cublas handle + streams +
+// buffers), so multiple evals from lc0's search threads OVERLAP on the GPU
+// instead of serializing on one mutex — the engine-fill profile found the GPU
+// ~65% idle during search; a Ctx pool keeps it fed. Everything runs on a
+// per-Ctx stream (NOT the default stream) so the overlap is real.
+// HERO_SLOTS (default 3) sets the pool size; =1 is the old serial path (A/B).
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,8 +22,6 @@
 #include "neural/hero/hero_weights.h"
 #include "neural/backends/cuda/kernels.h"
 
-// NOTE: unlike the standalone gate/bench, this builds as part of full lc0, so the
-// real CudaError (layers.cc) is linked — do NOT stub it here (would collide).
 using namespace lczero::cudnn_backend;
 using half_t = half;
 
@@ -42,7 +37,7 @@ static void gemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,
   CB(cublasGemmEx(h, ta, tb, m, n, k, &a, A, CUDA_R_16F, lda, B, CUDA_R_16F, ldb,
                   &b, C, CUDA_R_16F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
-static half_t* up_f(const std::vector<float>& v) {  // upload fp32 -> fp16 device (construction only)
+static half_t* up_f(const std::vector<float>& v) {  // fp32 -> fp16 device (construction only)
   if (v.empty()) return nullptr;
   half_t* d; CK(cudaMalloc(&d, v.size() * sizeof(half_t)));
   float* tmp; CK(cudaMalloc(&tmp, v.size() * sizeof(float)));
@@ -78,15 +73,12 @@ static std::vector<std::vector<float>> geo_basis() {
   return g;
 }
 
-// device kernels: FFN gather/scatter (rows pre-sorted by expert) + bias broadcast
 __global__ void k_gather(half_t* o,const half_t* in,const int* idx,int d){
   int r=blockIdx.x,c=blockIdx.y*blockDim.x+threadIdx.x; if(c<d) o[(size_t)r*d+c]=in[(size_t)idx[r]*d+c]; }
 __global__ void k_scatter(half_t* o,const half_t* in,const int* idx,int d){
   int r=blockIdx.x,c=blockIdx.y*blockDim.x+threadIdx.x; if(c<d) o[(size_t)idx[r]*d+c]=in[(size_t)r*d+c]; }
-// ---- device routing (13-class piece): replaces the host argmax + counting sort
-// (the large-batch bottleneck). planes are fp16 NCHW [N,112,64].
 __global__ void k_route13(int* route,const half_t* planes,int N){
-  int n=blockIdx.x, s=threadIdx.x;  // one block per position, 64 threads (squares)
+  int n=blockIdx.x, s=threadIdx.x;
   int best=-1; float bv=0.f; bool any=false;
   for(int c=0;c<12;c++){ float v=__half2float(planes[((size_t)n*112+c)*64+s]);
     if(v>0.f){any=true; if(best<0||v>bv){bv=v;best=c;}} }
@@ -94,21 +86,16 @@ __global__ void k_route13(int* route,const half_t* planes,int N){
 }
 __global__ void k_hist(int* cnt,const int* route,int R){
   int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R) atomicAdd(&cnt[route[r]],1); }
-__global__ void k_offsets(int* off,const int* cnt,int E){  // prefix sum, E tiny
+__global__ void k_offsets(int* off,const int* cnt,int E){
   if(threadIdx.x) return; off[0]=0; for(int e=0;e<E;e++) off[e+1]=off[e]+cnt[e]; }
 __global__ void k_order(int* order,int* cursor,const int* off,const int* route,int R){
   int r=blockIdx.x*blockDim.x+threadIdx.x; if(r>=R) return;
   int e=route[r]; order[off[e]+atomicAdd(&cursor[e],1)]=r; }
-// broadcast per-head bias (H,64,64) -> (N,H,64,64) for fusedMHA (batch-independent)
-__global__ void k_bcast_bias(half_t* o,const half_t* b,int HB){  // HB = H*64*64
-  int n=blockIdx.y, x=blockIdx.x*blockDim.x+threadIdx.x; if(x<HB) o[(size_t)n*HB+x]=b[x]; }
-// promotion logits: po[n,f,c] = sum_e kp[n,56+f,e]*PPO[c,e]  (f 0..7, c 0..3)
 __global__ void k_promo(half_t* po,const half_t* kp,const half_t* PPO,int N,int pd){
   int n=blockIdx.x, f=blockIdx.y, c=threadIdx.x; if(c>=4) return;
   const half_t* kr=kp+((size_t)n*64+56+f)*pd; const half_t* pr=PPO+(size_t)c*pd;
   float s=0; for(int e=0;e<pd;e++) s+=__half2float(kr[e])*__half2float(pr[e]);
   po[((size_t)n*8+f)*4+c]=__float2half(s); }
-// policy gather: cat4288[i*64+j | 4096+promo] -> 1858 via the fixed lc0 map
 __global__ void k_pol_gather(float* pol,const half_t* sc,const half_t* po,const int* g,int N){
   int n=blockIdx.x, m=blockIdx.y*blockDim.x+threadIdx.x; if(m>=1858) return;
   int idx=g[m]; float v;
@@ -117,7 +104,6 @@ __global__ void k_pol_gather(float* pol,const half_t* sc,const half_t* po,const 
     float base=__half2float(sc[(size_t)n*4096+(48+rr)*64+(56+f)]);
     v=base+__half2float(po[((size_t)n*8+f)*4+c])+__half2float(po[((size_t)n*8+f)*4+3]); }
   pol[(size_t)n*1858+m]=v; }
-// WDL = mean over the 64 query rows of the value attention output (N,64,3)
 __global__ void k_wdl_mean(float* wdl,const half_t* vout,int N){
   int n=blockIdx.x, c=threadIdx.x; if(c>=3) return;
   float s=0; for(int i=0;i<64;i++) s+=__half2float(vout[((size_t)n*64+i)*3+c]);
@@ -125,65 +111,70 @@ __global__ void k_wdl_mean(float* wdl,const half_t* vout,int N){
 
 // ============================ the forward object ============================
 struct HeroForward::Impl {
-  HeroWeights w;               // host weights kept only for head-side host math
-  cublasHandle_t cub;
-  static const int NS = 8;    // max streams allocated for concurrent expert FFN
-  int nsUse = NS;             // active count (env HERO_FFN_STREAMS, 1..NS) — for
-                             // the serial-vs-streamed large-batch A/B test
-  bool prof = false;         // HERO_PROFILE: split-time the forward's components
-  cudaEvent_t pe[6];
-  double tqkv=0,tmha=0,tout=0,tffn=0,tln=0; int pcalls=0;
-  // grouped-GEMM FFN (HERO_FFN_GROUPED): all E experts in 2 batched calls. A/B'd
-  // 2026-09-18 — cuBLAS grouped is ~6% SLOWER than the multi-stream loop (worse
-  // per-gemm kernels), so default OFF; kept behind the env for reference.
-  bool grouped = false;
-  std::vector<int> gM,gRows,gK,gLdA,gLdB,gLdC,gSz;
-  std::vector<cublasOperation_t> gTA,gTB;
-  std::vector<float> gAlpha,gBeta;
-  std::vector<const void*> gUpA,gUpB,gDnA,gDnB;
-  std::vector<void*> gUpC,gDnC;
-  cudaStream_t streams[NS];   // experts are independent; run them in parallel
-  cudaEvent_t ev_gather, ev_done[NS];
-  std::mutex mtx;             // lc0 calls ComputeBlocking from multiple search
-                             // threads; one GPU -> serialize the forward (leaf
-                             // collection still runs parallel on the CPU side)
-  int d, L, H, hd, dff, E, ed, pd;
-  float alpha;
-  int capN = 0;                // batch the scratch is sized for (grows on demand)
-
-  // ---- weights (device, uploaded once) ----
+  HeroWeights w;
+  int d,L,H,hd,dff,E,ed,pd; float alpha; int device=0;
+  static const int NS = 8;    // streams for concurrent expert FFN inside a Ctx
+  int nsUse = NS;
+  // ---- shared weights (device, uploaded once, read-only) ----
   half_t *pp0,*pp1,*emb,*eln,*eu,*edn,*efln,*zbuf;
-  struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias; };  // bias: (H,64,64) fp16
+  struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias; };
   std::vector<LW> lw;
-  // head weights (device, uploaded once) + policy-promotion + gather map
   half_t *h_pe,*h_peb,*h_pq,*h_pqb,*h_pk,*h_pkb,*h_ve,*h_vq,*h_vk,*h_vv,*h_ppo;
-  int* dGather=nullptr;        // 1858 policy move indices (uploaded on first Run)
+  int* dGather=nullptr; std::once_flag gather_once;
 
-  // ---- scratch (device, sized to capN) ----
-  half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
-  half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn;
-  // device head scratch
-  half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
-  float *d_pol,*d_wdl;
-  int *dOrder,*dRoute;        // per-row (sized to batch)
-  int *dCnt,*dCursor,*dOff;   // per-expert (E), allocated once
+  // ---- per-forward context (pooled) ----
+  struct Ctx {
+    Impl* I; cublasHandle_t cub; cudaStream_t main; cudaStream_t streams[NS];
+    cudaEvent_t ev_gather, ev_done[NS];
+    int capN=0;
+    half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
+    half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn;
+    half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
+    float *tmpP,*tmpF,*d_pol,*d_wdl;
+    int *dOrder,*dRoute,*dCnt,*dCursor,*dOff;
+    void setup(Impl* imp){ I=imp;
+      CK(cudaSetDevice(I->device));
+      CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub,CUBLAS_TENSOR_OP_MATH));
+      CK(cudaStreamCreate(&main)); CB(cublasSetStream(cub,main));
+      for(int s=0;s<NS;s++){ CK(cudaStreamCreate(&streams[s])); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
+      cudaEventCreateWithFlags(&ev_gather,cudaEventDisableTiming);
+      CK(cudaMalloc(&dCnt,I->E*sizeof(int))); CK(cudaMalloc(&dCursor,I->E*sizeof(int))); CK(cudaMalloc(&dOff,(I->E+1)*sizeof(int)));
+      ensure(512);
+    }
+    void ensure(int N){
+      if(N<=capN) return; int d=I->d,ed=I->ed,pd=I->pd,dff=I->dff;
+      if(capN){ for(half_t* p:{dPlanes,dFlat,pos128,pos8192,cat240,emb_d,e_out,up_h,dn_h,x,
+                               qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
+                cudaFree(tmpP);cudaFree(tmpF);cudaFree(dOrder);cudaFree(dRoute);cudaFree(d_pol);cudaFree(d_wdl); }
+      const size_t T=(size_t)N*64*d, R=(size_t)N*64;
+      auto A=[&](half_t** p,size_t n){ CK(cudaMalloc(p,n*sizeof(half_t))); };
+      A(&dPlanes,(size_t)N*112*64);A(&dFlat,(size_t)N*768);A(&pos128,(size_t)N*128);A(&pos8192,(size_t)N*8192);
+      A(&cat240,R*240);A(&emb_d,T);A(&e_out,T);A(&up_h,R*ed);A(&dn_h,T);A(&x,T);A(&qd,T);A(&kd,T);A(&vd,T);A(&po,T);
+      A(&attn,T);A(&xa,T);A(&xs,T);A(&ffgh,R*dff);A(&ys,T);A(&ffn,T);
+      A(&tp,R*(size_t)pd);A(&qp,R*(size_t)pd);A(&kp,R*(size_t)pd);A(&scp,(size_t)N*4096);A(&promo,(size_t)N*8*4);
+      A(&tv,R*(size_t)pd);A(&qv,R*(size_t)pd);A(&kv,R*(size_t)pd);A(&vvh,R*3);A(&scv,(size_t)N*4096);A(&vout,R*3);
+      CK(cudaMalloc(&tmpP,(size_t)N*112*64*sizeof(float))); CK(cudaMalloc(&tmpF,(size_t)N*768*sizeof(float)));
+      CK(cudaMalloc(&dOrder,R*sizeof(int)));CK(cudaMalloc(&dRoute,R*sizeof(int)));
+      CK(cudaMalloc(&d_pol,(size_t)N*1858*sizeof(float)));CK(cudaMalloc(&d_wdl,(size_t)N*3*sizeof(float)));
+      capN=N;
+    }
+    void head_gemm(half_t* W,int in,int out,half_t* bias,bool mish,half_t* xin,int rows,half_t* od){
+      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,1.f,W,in,xin,in,0.f,od,out);
+      if(bias) addBiasBatched<half_t>(od,od,bias,1,rows,out,mish?ACTIVATION_MISH:ACTIVATION_NONE,main);
+      else if(mish) addBiasBatched<half_t>(od,od,I->zbuf,1,rows,out,ACTIVATION_MISH,main);
+    }
+  };
+  std::vector<Ctx> ctxs;
+  std::mutex pool_mtx; std::condition_variable pool_cv; std::vector<int> freelist;
+  int acquire(){ std::unique_lock<std::mutex> lk(pool_mtx); pool_cv.wait(lk,[&]{return !freelist.empty();});
+    int c=freelist.back(); freelist.pop_back(); return c; }
+  void release(int c){ { std::lock_guard<std::mutex> lk(pool_mtx); freelist.push_back(c);} pool_cv.notify_one(); }
 
-  int device = 0;              // GPU id (multi-GPU: multiplexing gives gpu=0/1/...)
   Impl(const HeroWeights& wt, int gpu) : w(wt), device(gpu) {
     CK(cudaSetDevice(device));
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
     alpha = powf(2.f*L, -0.25f);
-    CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH));
-    for (int s=0;s<NS;s++){ cudaStreamCreate(&streams[s]); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
-    cudaEventCreateWithFlags(&ev_gather,cudaEventDisableTiming);
     if (const char* e=getenv("HERO_FFN_STREAMS")){ nsUse=atoi(e); if(nsUse<1)nsUse=1; if(nsUse>NS)nsUse=NS; }
-    prof = getenv("HERO_PROFILE")!=nullptr;
-    for (int i=0;i<6;i++) cudaEventCreate(&pe[i]);
-    if (const char* e=getenv("HERO_FFN_GROUPED")) grouped = atoi(e)!=0;
-    gM.resize(E); gRows.resize(E); gK.resize(E); gLdA.resize(E); gLdB.resize(E); gLdC.resize(E);
-    gSz.assign(E,1); gTA.assign(E,CUBLAS_OP_T); gTB.assign(E,CUBLAS_OP_N);
-    gAlpha.assign(E,1.f); gBeta.assign(E,0.f);
-    gUpA.resize(E);gUpB.resize(E);gUpC.resize(E);gDnA.resize(E);gDnB.resize(E);gDnC.resize(E);
     pp0=up_f(w.preproc0_w); pp1=up_f(w.preproc1_w); emb=up_f(w.embed_w); eln=up_f(w.embed_ln_g);
     eu=up_f(w.embed_up_w); edn=up_f(w.embed_down_w); efln=up_f(w.embed_ffn_ln_g);
     std::vector<float> zeros((d>dff?d:dff),0.f); zbuf=up_f(zeros);
@@ -193,7 +184,7 @@ struct HeroForward::Impl {
       auto& s=w.layer[li]; auto& t=lw[li];
       t.qw=up_f(s.q_w); t.kw=up_f(s.k_w); t.vw=up_f(s.v_w); t.ow=up_f(s.out_w);
       t.l1g=up_f(s.ln1_g); t.l2g=up_f(s.ln2_g); t.up=up_f(s.ffn_up); t.dn=up_f(s.ffn_down);
-      std::vector<float> bias_hhh((size_t)H*64*64, 0.f);   // free + alpha_mix . geo (once)
+      std::vector<float> bias_hhh((size_t)H*64*64, 0.f);
       for (int h=0;h<H;h++) for (int i=0;i<64;i++) for (int j=0;j<64;j++){
         double b=s.free[(size_t)h*64*64+i*64+j];
         for (int k=0;k<18;k++) b += (double)s.alpha[h*18+k]*geo[k][i*64+j];
@@ -201,50 +192,13 @@ struct HeroForward::Impl {
       }
       t.bias=up_f(bias_hhh);
     }
-    // head weights once
     h_pe=up_f(w.pol_embed_w); h_peb=up_f(w.pol_embed_b);
     h_pq=up_f(w.pol_q_w); h_pqb=up_f(w.pol_q_b); h_pk=up_f(w.pol_k_w); h_pkb=up_f(w.pol_k_b);
     h_ve=up_f(w.val_embed_w); h_vq=up_f(w.val_q_w); h_vk=up_f(w.val_k_w); h_vv=up_f(w.val_v_w);
     h_ppo=up_f(w.pol_ppo_w);
-    CK(cudaMalloc(&dCnt,E*sizeof(int))); CK(cudaMalloc(&dCursor,E*sizeof(int))); CK(cudaMalloc(&dOff,(E+1)*sizeof(int)));
-    ensure(512);   // preallocate for the useful minibatch range (no mid-search realloc)
-  }
-
-  void ensure(int N) {                 // (re)allocate scratch for batch N
-    if (N <= capN) return;
-    if (capN) { for (half_t* p : {dPlanes,dFlat,pos128,pos8192,cat240,emb_d,e_out,up_h,dn_h,x,
-                                   qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,
-                                   tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
-                cudaFree(dOrder); cudaFree(dRoute); cudaFree(d_pol); cudaFree(d_wdl); }
-    const size_t T=(size_t)N*64*d, R=(size_t)N*64;
-    auto A=[&](half_t** p,size_t n){ CK(cudaMalloc(p,n*sizeof(half_t))); };
-    A(&dPlanes,(size_t)N*112*64); A(&dFlat,(size_t)N*768); A(&pos128,(size_t)N*128);
-    A(&pos8192,(size_t)N*8192); A(&cat240,R*240); A(&emb_d,T); A(&e_out,T);
-    A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,T); A(&kd,T); A(&vd,T); A(&po,T);
-    A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
-    A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
-    A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
-    A(&vvh,R*3); A(&scv,(size_t)N*4096); A(&vout,R*3);
-    CK(cudaMalloc(&dOrder,R*sizeof(int))); CK(cudaMalloc(&dRoute,R*sizeof(int)));
-    CK(cudaMalloc(&d_pol,(size_t)N*1858*sizeof(float))); CK(cudaMalloc(&d_wdl,(size_t)N*3*sizeof(float)));
-    capN = N;
-  }
-
-  void route13(const float* pl, int N, std::vector<int>& route) {
-    route.assign((size_t)N*64, 0);
-    for (int n=0;n<N;n++) for (int s=0;s<64;s++) {
-      int best=-1; float bv=0.f; bool any=false;
-      for (int c=0;c<12;c++){ float v=pl[((size_t)n*112+c)*64+s]; if(v>0.f){any=true; if(best<0||v>bv){bv=v;best=c;}} }
-      route[(size_t)n*64+s] = any ? best+1 : 0;
-    }
-  }
-
-  // device gemm on a head weight into out_dev (rows x out), optional bias+mish
-  void head_gemm(half_t* W, int in, int out, half_t* bias, bool mish,
-                 half_t* xin_dev, int rows, half_t* out_dev) {
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,1.f,W,in,xin_dev,in,0.f,out_dev,out);
-    if (bias) addBiasBatched<half_t>(out_dev,out_dev,bias,1,rows,out,mish?ACTIVATION_MISH:ACTIVATION_NONE,0);
-    else if (mish) addBiasBatched<half_t>(out_dev,out_dev,zbuf,1,rows,out,ACTIVATION_MISH,0);
+    int slots=3; if(const char* e=getenv("HERO_SLOTS")){ slots=atoi(e); if(slots<1)slots=1; }
+    ctxs.resize(slots);
+    for(int i=0;i<slots;i++){ ctxs[i].setup(this); freelist.push_back(i); }
   }
 };
 
@@ -254,132 +208,87 @@ HeroForward::~HeroForward() { delete p_; }
 
 void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
                       const std::vector<int>& gather, float* policy_out, float* wdl_out) {
-  Impl& I=*p_; std::lock_guard<std::mutex> lk(I.mtx); CK(cudaSetDevice(I.device)); I.ensure(N); cublasHandle_t cub=I.cub;
+  Impl& I=*p_; CK(cudaSetDevice(I.device));
+  std::call_once(I.gather_once, [&]{ CK(cudaMalloc(&I.dGather,1858*sizeof(int)));
+    CK(cudaMemcpy(I.dGather,gather.data(),1858*sizeof(int),cudaMemcpyHostToDevice)); });
+  int ci=I.acquire(); Impl::Ctx& C=I.ctxs[ci];
+  cublasHandle_t cub=C.cub; cudaStream_t S=C.main; C.ensure(N);
   const int d=I.d,H=I.H,hd=I.hd,dff=I.dff,E=I.E,ed=I.ed,pd=I.pd; const float al=I.alpha;
   const size_t T=(size_t)N*64*d; const int R=N*64;
 
-  { // upload planes (fp32 -> fp16) via copyTypeConverted
-    float* tmp; CK(cudaMalloc(&tmp,(size_t)N*112*64*sizeof(float)));
-    CK(cudaMemcpy(tmp,planes_nchw,(size_t)N*112*64*sizeof(float),cudaMemcpyHostToDevice));
-    copyTypeConverted(I.dPlanes,tmp,(int)((size_t)N*112*64),0); CK(cudaFree(tmp));
-    CK(cudaMalloc(&tmp,(size_t)N*768*sizeof(float)));
-    CK(cudaMemcpy(tmp,flat12,(size_t)N*768*sizeof(float),cudaMemcpyHostToDevice));
-    copyTypeConverted(I.dFlat,tmp,(int)((size_t)N*768),0); CK(cudaFree(tmp));
-  }
+  // upload planes (fp32 -> fp16) on this Ctx's stream (per-Ctx tmp buffers)
+  CK(cudaMemcpyAsync(C.tmpP,planes_nchw,(size_t)N*112*64*sizeof(float),cudaMemcpyHostToDevice,S));
+  copyTypeConverted(C.dPlanes,C.tmpP,(int)((size_t)N*112*64),S);
+  CK(cudaMemcpyAsync(C.tmpF,flat12,(size_t)N*768*sizeof(float),cudaMemcpyHostToDevice,S));
+  copyTypeConverted(C.dFlat,C.tmpF,(int)((size_t)N*768),S);
 
-  // ---- device routing (all on GPU; only off[] returns to host to size the
-  // per-expert gemms). Done here so its tiny D2H sync doesn't wait on the stem.
+  // device routing -> off[] to host (need sizes for the per-expert gemms)
   std::vector<int> off(E+1);
-  CK(cudaMemset(I.dCnt,0,E*sizeof(int))); CK(cudaMemset(I.dCursor,0,E*sizeof(int)));
-  k_route13<<<N,64>>>(I.dRoute, I.dPlanes, N);
-  k_hist<<<(R+255)/256,256>>>(I.dCnt, I.dRoute, R);
-  k_offsets<<<1,1>>>(I.dOff, I.dCnt, E);
-  k_order<<<(R+255)/256,256>>>(I.dOrder, I.dCursor, I.dOff, I.dRoute, R);
-  CK(cudaMemcpy(off.data(), I.dOff, (E+1)*sizeof(int), cudaMemcpyDeviceToHost));
+  CK(cudaMemsetAsync(C.dCnt,0,E*sizeof(int),S)); CK(cudaMemsetAsync(C.dCursor,0,E*sizeof(int),S));
+  k_route13<<<N,64,0,S>>>(C.dRoute,C.dPlanes,N);
+  k_hist<<<(R+255)/256,256,0,S>>>(C.dCnt,C.dRoute,R);
+  k_offsets<<<1,1,0,S>>>(C.dOff,C.dCnt,E);
+  k_order<<<(R+255)/256,256,0,S>>>(C.dOrder,C.dCursor,C.dOff,C.dRoute,R);
+  CK(cudaMemcpyAsync(off.data(),C.dOff,(E+1)*sizeof(int),cudaMemcpyDeviceToHost,S));
+  CK(cudaStreamSynchronize(S));   // off[] ready; waits only THIS Ctx's stream
 
-  // ---- stem ----
-  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,128,N,768,1.f,I.pp0,768,I.dFlat,768,0.f,I.pos128,128);
-  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,8192,N,128,1.f,I.pp1,128,I.pos128,128,0.f,I.pos8192,8192);
-  inputPreprocessForAttentionBody<half_t>(I.cat240,I.dPlanes,I.pos8192,N,112,128,true,0);
-  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,240,1.f,I.emb,240,I.cat240,240,0.f,I.emb_d,d);
-  LayerNorm<half_t>(R,d,I.e_out,I.emb_d,I.zbuf,(half_t*)nullptr,I.eln,I.zbuf,1e-3f,1.f,ACTIVATION_MISH,0);
-  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,ed,R,d,1.f,I.eu,d,I.e_out,d,0.f,I.up_h,ed);
-  addBiasBatched<half_t>(I.up_h,I.up_h,I.zbuf,1,R,ed,ACTIVATION_MISH,0);
-  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,ed,1.f,I.edn,ed,I.up_h,ed,0.f,I.dn_h,d);
-  LayerNorm<half_t>(R,d,I.x,I.dn_h,I.zbuf,I.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
+  // stem
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,128,N,768,1.f,I.pp0,768,C.dFlat,768,0.f,C.pos128,128);
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,8192,N,128,1.f,I.pp1,128,C.pos128,128,0.f,C.pos8192,8192);
+  inputPreprocessForAttentionBody<half_t>(C.cat240,C.dPlanes,C.pos8192,N,112,128,true,S);
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,240,1.f,I.emb,240,C.cat240,240,0.f,C.emb_d,d);
+  LayerNorm<half_t>(R,d,C.e_out,C.emb_d,I.zbuf,(half_t*)nullptr,I.eln,I.zbuf,1e-3f,1.f,ACTIVATION_MISH,S);
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,ed,R,d,1.f,I.eu,d,C.e_out,d,0.f,C.up_h,ed);
+  addBiasBatched<half_t>(C.up_h,C.up_h,I.zbuf,1,R,ed,ACTIVATION_MISH,S);
+  gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,ed,1.f,I.edn,ed,C.up_h,ed,0.f,C.dn_h,d);
+  LayerNorm<half_t>(R,d,C.x,C.dn_h,I.zbuf,C.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,S);
 
-  // ---- route + host sort -> order/offsets ----
-  // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
+  // trunk: 15 layers (fusedMHA + gather/scatter expert FFN)
   dim3 gd(R,(d+255)/256);
   for (int li=0; li<I.L; li++){
     auto& t=I.lw[li];
-    if(I.prof)cudaEventRecord(I.pe[0],0);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,d);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,d);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,d);
-    if(I.prof)cudaEventRecord(I.pe[1],0);
-    // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
-    // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
-    fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
-    if(I.prof)cudaEventRecord(I.pe[2],0);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
-    LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
-    if(I.prof)cudaEventRecord(I.pe[3],0);
-    // expert FFN: gather (default stream) -> per-expert up/mish/down run
-    // CONCURRENTLY across NS streams (experts are independent) -> scatter.
-    k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
-    if (I.grouped) {
-      // all experts in ONE up-gemm + ONE fused mish + ONE down-gemm
-      int ng=0;
-      for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
-        I.gRows[ng]=m;
-        I.gUpA[ng]=t.up+(size_t)e*dff*d; I.gUpB[ng]=I.xs+(size_t)off[e]*d; I.gUpC[ng]=I.ffgh+(size_t)off[e]*dff;
-        I.gDnA[ng]=t.dn+(size_t)e*d*dff; I.gDnB[ng]=I.ffgh+(size_t)off[e]*dff; I.gDnC[ng]=I.ys+(size_t)off[e]*d;
-        ng++; }
-      // up: C[dff x m] = up[dff x d]^T @ xs[d x m];  lda=d ldb=d ldc=dff
-      for(int i=0;i<ng;i++){ I.gM[i]=dff; I.gK[i]=d; I.gLdA[i]=d; I.gLdB[i]=d; I.gLdC[i]=dff; }
-      CB(cublasGemmGroupedBatchedEx(cub, I.gTA.data(),I.gTB.data(), I.gM.data(),I.gRows.data(),I.gK.data(),
-          I.gAlpha.data(), I.gUpA.data(),CUDA_R_16F,I.gLdA.data(), I.gUpB.data(),CUDA_R_16F,I.gLdB.data(),
-          I.gBeta.data(), I.gUpC.data(),CUDA_R_16F,I.gLdC.data(), ng, I.gSz.data(), CUBLAS_COMPUTE_32F));
-      addBiasBatched<half_t>(I.ffgh,I.ffgh,I.zbuf,1,R,dff,ACTIVATION_MISH,0);   // one mish over all gathered rows
-      // down: C[d x m] = dn[d x dff]^T @ ffgh[dff x m];  lda=dff ldb=dff ldc=d
-      for(int i=0;i<ng;i++){ I.gM[i]=d; I.gK[i]=dff; I.gLdA[i]=dff; I.gLdB[i]=dff; I.gLdC[i]=d; }
-      CB(cublasGemmGroupedBatchedEx(cub, I.gTA.data(),I.gTB.data(), I.gM.data(),I.gRows.data(),I.gK.data(),
-          I.gAlpha.data(), I.gDnA.data(),CUDA_R_16F,I.gLdA.data(), I.gDnB.data(),CUDA_R_16F,I.gLdB.data(),
-          I.gBeta.data(), I.gDnC.data(),CUDA_R_16F,I.gLdC.data(), ng, I.gSz.data(), CUBLAS_COMPUTE_32F));
-    } else {
-      cudaEventRecord(I.ev_gather, 0);
-      for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
-        cudaStream_t st=I.streams[e % I.nsUse];
-        cudaStreamWaitEvent(st, I.ev_gather, 0);
-        cublasSetStream(cub, st);
-        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
-        addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
-        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
-      for (int s=0;s<I.nsUse;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
-      cublasSetStream(cub, 0);
-    }
-    k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
-    if(I.prof)cudaEventRecord(I.pe[4],0);
-    LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
-    if(I.prof){ cudaEventRecord(I.pe[5],0); cudaEventSynchronize(I.pe[5]); float a;
-      cudaEventElapsedTime(&a,I.pe[0],I.pe[1]); I.tqkv+=a;   // 3 qkv projection gemms
-      cudaEventElapsedTime(&a,I.pe[1],I.pe[2]); I.tmha+=a;   // fusedMHA
-      cudaEventElapsedTime(&a,I.pe[2],I.pe[3]); I.tout+=a;   // out gemm + LN1
-      cudaEventElapsedTime(&a,I.pe[3],I.pe[4]); I.tffn+=a;   // gather + experts + scatter
-      cudaEventElapsedTime(&a,I.pe[4],I.pe[5]); I.tln+=a; }  // LN2
-  }
-  if(I.prof && (++I.pcalls)%20==0){
-    double tot=I.tqkv+I.tmha+I.tout+I.tffn+I.tln;
-    printf("PROFILE bs=%d over 20x15 layers: qkv=%.0f%% mha=%.0f%% out+ln1=%.0f%% ffn=%.0f%% ln2=%.0f%%  (tot %.1fms/20fwd)\n",
-      N,100*I.tqkv/tot,100*I.tmha/tot,100*I.tout/tot,100*I.tffn/tot,100*I.tln/tot,tot/1.0);
-    fflush(stdout); I.tqkv=I.tmha=I.tout=I.tffn=I.tln=0;
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.qw,d,C.x,d,0.f,C.qd,d);
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.kw,d,C.x,d,0.f,C.kd,d);
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.vw,d,C.x,d,0.f,C.vd,d);
+    fusedMHA<half_t>(C.po,C.qd,C.kd,C.vd,t.bias,N,H,hd,S,true);
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,C.po,d,0.f,C.attn,d);
+    LayerNorm<half_t>(R,d,C.xa,C.attn,I.zbuf,C.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,S);
+    // expert FFN: gather -> per-expert up/mish/down across NS streams -> scatter
+    k_gather<<<gd,256,0,S>>>(C.xs,C.xa,C.dOrder,d);
+    cudaEventRecord(C.ev_gather,S);
+    for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
+      cudaStream_t st=C.streams[e % I.nsUse];
+      cudaStreamWaitEvent(st,C.ev_gather,0);
+      cublasSetStream(cub,st);
+      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,C.xs+(size_t)off[e]*d,d,0.f,C.ffgh+(size_t)off[e]*dff,dff);
+      addBiasBatched<half_t>(C.ffgh+(size_t)off[e]*dff,C.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
+      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,C.ffgh+(size_t)off[e]*dff,dff,0.f,C.ys+(size_t)off[e]*d,d); }
+    for (int s=0;s<I.nsUse;s++){ cudaEventRecord(C.ev_done[s],C.streams[s]); cudaStreamWaitEvent(S,C.ev_done[s],0); }
+    cublasSetStream(cub,S);
+    k_scatter<<<gd,256,0,S>>>(C.ffn,C.ys,C.dOrder,d);
+    LayerNorm<half_t>(R,d,C.x,C.ffn,I.zbuf,C.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,S);
   }
 
-  // ---- heads (fully device-resident) ----
-  if (!I.dGather) { CK(cudaMalloc(&I.dGather,1858*sizeof(int)));
-    CK(cudaMemcpy(I.dGather,gather.data(),1858*sizeof(int),cudaMemcpyHostToDevice)); }
-  const float sc = 1.f/sqrtf((float)pd), z=0.f, o=1.f;
-  // policy: tp = mish(pol_embed(x)+b); qp,kp = pol_q/k(tp)+b; scp = qp.kp^T*sc; +promo; gather
-  I.head_gemm(I.h_pe,d,pd,I.h_peb,true,I.x,R,I.tp);
-  I.head_gemm(I.h_pq,pd,pd,I.h_pqb,false,I.tp,R,I.qp);
-  I.head_gemm(I.h_pk,pd,pd,I.h_pkb,false,I.tp,R,I.kp);
-  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,I.kp,CUDA_R_16F,pd,64*pd,I.qp,CUDA_R_16F,pd,64*pd,&z,I.scp,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
-  { dim3 pg(N,8); k_promo<<<pg,4>>>(I.promo,I.kp,I.h_ppo,N,pd); }
-  { dim3 gg(N,(1858+255)/256); k_pol_gather<<<gg,256>>>(I.d_pol,I.scp,I.promo,I.dGather,N); }
-  // value: tv = mish(val_embed(x)); qv,kv,vv; softmax(qv.kv^T*sc) then .vv, mean over queries
-  I.head_gemm(I.h_ve,d,pd,nullptr,true,I.x,R,I.tv);
-  I.head_gemm(I.h_vq,pd,pd,nullptr,false,I.tv,R,I.qv);
-  I.head_gemm(I.h_vk,pd,pd,nullptr,false,I.tv,R,I.kv);
-  I.head_gemm(I.h_vv,pd,3,nullptr,false,I.tv,R,I.vvh);
-  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,I.kv,CUDA_R_16F,pd,64*pd,I.qv,CUDA_R_16F,pd,64*pd,&z,I.scv,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
-  Softmax<half_t>(N*64,64,I.scv,I.scv,(half_t*)nullptr,0);
-  // vout(N,64,3) = scv(64x64) . vv(64x3), per position (see .cu notes for the layout)
-  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,3,64,64,&o,I.vvh,CUDA_R_16F,3,64*3,I.scv,CUDA_R_16F,64,64*64,&z,I.vout,CUDA_R_16F,3,64*3,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
-  k_wdl_mean<<<N,3>>>(I.d_wdl,I.vout,N);
-  CK(cudaDeviceSynchronize());
-  CK(cudaMemcpy(policy_out,I.d_pol,(size_t)N*1858*sizeof(float),cudaMemcpyDeviceToHost));
-  CK(cudaMemcpy(wdl_out,I.d_wdl,(size_t)N*3*sizeof(float),cudaMemcpyDeviceToHost));
+  // heads (fully device-resident, all on this Ctx's stream)
+  const float sc=1.f/sqrtf((float)pd), z=0.f, o=1.f;
+  C.head_gemm(I.h_pe,d,pd,I.h_peb,true,C.x,R,C.tp);
+  C.head_gemm(I.h_pq,pd,pd,I.h_pqb,false,C.tp,R,C.qp);
+  C.head_gemm(I.h_pk,pd,pd,I.h_pkb,false,C.tp,R,C.kp);
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,C.kp,CUDA_R_16F,pd,64*pd,C.qp,CUDA_R_16F,pd,64*pd,&z,C.scp,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  { dim3 pg(N,8); k_promo<<<pg,4,0,S>>>(C.promo,C.kp,I.h_ppo,N,pd); }
+  { dim3 gg(N,(1858+255)/256); k_pol_gather<<<gg,256,0,S>>>(C.d_pol,C.scp,C.promo,I.dGather,N); }
+  C.head_gemm(I.h_ve,d,pd,nullptr,true,C.x,R,C.tv);
+  C.head_gemm(I.h_vq,pd,pd,nullptr,false,C.tv,R,C.qv);
+  C.head_gemm(I.h_vk,pd,pd,nullptr,false,C.tv,R,C.kv);
+  C.head_gemm(I.h_vv,pd,3,nullptr,false,C.tv,R,C.vvh);
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,C.kv,CUDA_R_16F,pd,64*pd,C.qv,CUDA_R_16F,pd,64*pd,&z,C.scv,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  Softmax<half_t>(N*64,64,C.scv,C.scv,(half_t*)nullptr,S);
+  CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,3,64,64,&o,C.vvh,CUDA_R_16F,3,64*3,C.scv,CUDA_R_16F,64,64*64,&z,C.vout,CUDA_R_16F,3,64*3,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+  k_wdl_mean<<<N,3,0,S>>>(C.d_wdl,C.vout,N);
+  CK(cudaMemcpyAsync(policy_out,C.d_pol,(size_t)N*1858*sizeof(float),cudaMemcpyDeviceToHost,S));
+  CK(cudaMemcpyAsync(wdl_out,C.d_wdl,(size_t)N*3*sizeof(float),cudaMemcpyDeviceToHost,S));
+  CK(cudaStreamSynchronize(S));   // results ready; only THIS Ctx's stream
+  I.release(ci);
 }
 
 }  // namespace hero
