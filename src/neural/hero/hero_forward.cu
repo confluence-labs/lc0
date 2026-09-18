@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -274,12 +275,20 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   LayerNorm<half_t>(R,d,I.x,I.dn_h,I.zbuf,I.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
 
   // ---- route (class-count-aware) + host sort -> order/offsets ----
+  // HERO_PROFILE=1 -> time the pure-host route+sort (prime bottleneck suspect)
+  static const bool prof = getenv("HERO_PROFILE") != nullptr;
+  static double acc_route_ms = 0; static long prof_calls = 0;
+  std::chrono::steady_clock::time_point _r0;
+  if (prof) { CK(cudaDeviceSynchronize()); _r0 = std::chrono::steady_clock::now(); }
   std::vector<int> route; I.route(planes_nchw,N,route);
   std::vector<int> order(R), off(E+1,0), cnt(E,0);
   for (int r=0;r<R;r++) cnt[route[r]]++;
   for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
   { std::vector<int> cur(off.begin(),off.end()-1); for(int r=0;r<R;r++) order[cur[route[r]]++]=r; }
   CK(cudaMemcpy(I.dOrder,order.data(),R*sizeof(int),cudaMemcpyHostToDevice));
+  if (prof) { auto _r1=std::chrono::steady_clock::now();
+    acc_route_ms += std::chrono::duration<double,std::milli>(_r1-_r0).count();
+    if (++prof_calls % 50 == 0) fprintf(stderr,"HEROPROF N=%d route+sort avg = %.2f ms/call over %ld calls\n", N, acc_route_ms/prof_calls, prof_calls); }
 
   // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
   dim3 gd(R,(d+255)/256);
