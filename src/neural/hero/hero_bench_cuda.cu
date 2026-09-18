@@ -40,7 +40,8 @@ int main(int argc,char** argv){
   int E = argc>4?atoi(argv[4]):13;          // experts
   int dff = argc>5?atoi(argv[5]):(d*5)/4;   // FFN width (hero3=1280, hero4=2048); default 1.25d
   int H=d/hd, ed=d/2;                       // heads=d/32, embed_dff=0.5d
-  double actM = L*(4.0*d*d + 2.0*(double)d*dff)/1e6;  // ~active params (M): attn 4d^2 + 1 expert 2*d*dff
+  double actM = L*(4.0*d*d + 2.0*(double)d*dff)/1e6;                    // active: attn 4d^2 + 1 expert 2*d*dff
+  double totM = actM + L*(double)(E-1)*2.0*d*dff/1e6;                   // + the E-1 inactive experts
   char name[64]; cudaDeviceProp pr; cudaGetDeviceProperties(&pr,0); snprintf(name,64,"%s",pr.name);
   double peak = strstr(name,"A100")?312e12: strstr(name,"H100")?989e12: strstr(name,"L4")?121e12: strstr(name,"L40")?181e12:100e12;
   cublasHandle_t cub; CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub,CUBLAS_TENSOR_OP_MATH));
@@ -115,7 +116,7 @@ int main(int argc,char** argv){
   double gflop=(512.0*d*d + 256.0*(double)d*dff)*L/1e9;
   double posps=B/per, mfu=gflop*1e9*posps/peak;
   double tot=t_attn+t_ffn;
-  printf("HERO TRUNK bench: dev=%s d=%d dff=%d H=%d L=%d E=%d act~%.0fM B=%d  %.2f ms/fwd  %.0f pos/s  MFU~%.3f  [attn %.0f%% ffn %.0f%%]\n",
-         name,d,dff,H,L,E,actM,B,per*1000,posps,mfu, 100*t_attn/tot, 100*t_ffn/tot);
+  printf("HEROSHAPE d=%d dff=%d H=%d L=%d E=%d act=%.0fM tot=%.0fM | %.0f pos/s  MFU=%.3f  ms=%.1f  [attn %.0f%% ffn %.0f%%]\n",
+         d,dff,H,L,E,actM,totM,posps,mfu,per*1000, 100*t_attn/tot, 100*t_ffn/tot);
   printf("BENCH_DONE\n"); return 0;
 }
