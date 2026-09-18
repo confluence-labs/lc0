@@ -96,10 +96,29 @@ the forward-only 7,344 pos/s (bs=256). Real-game sustained nps sits between.
 STILL: hero engine nps now exceeds the BT4 13,825 reference under matched-ish
 settings — the launch thesis (small net, fast backend, time-fair parity) is live.
 
-NEXT: (1) measure BT4 the SAME way for the apples-to-apples claim (needs the
-cuda-backend flag bug sorted, or the BT4 track does it); (2) CUTLASS grouped FFN
-to lift the cache-independent forward toward the ~10.7k trunk ceiling; (3) set
-the hero backend defaults to mb=384/threads=2.
+**APPLES-TO-APPLES (2026-09-17, commit a3cbcf2): hero ~91% of BT4.** Fixed the
+cuda-backend flag (wrapper.cc: inject kWeightsId ONLY for hero .htw — cuda never
+reads it, CheckAllOptionsRead threw). Benchmarked BT4 + hero on the SAME lc0
+build, SAME A100, SAME settings (mb=384/th=2/nncache=2e6, nodes=120000):
+
+| engine | matched nps | default nps |
+|--------|-------------|-------------|
+| BT4 (cuda-fp16) | **21,923** | 21,134 |
+| HERO            | **20,055** | 20,012 |
+
+**IMPORTANT CORRECTION:** the 13,825 "BT4 reference" was STALE / different
+conditions. On our A100 at these settings BT4 does ~21,900 nps, NOT 13,825. So
+hero does NOT beat BT4 on raw nps — it's at ~91% (20.0k vs 21.9k). Earlier
+"hero > BT4" claims (based on 13,825) are RETRACTED. Hero's backend is
+nonetheless within 9% of BT4's mature backend from a standing start today, with
+headroom left. NOTE: the launch thesis is time-fair *Elo* = nps x strength/node;
+if hero is stronger per node it can still win at equal nps-ish — but that's the
+training side. My job: close the 9% and push past.
+
+NEXT: (1) CUTLASS grouped FFN + close the forward<->trunk gap to lift hero's nps
+toward/past BT4's 21.9k; (2) set hero backend defaults mb=384/threads=2; (3) the
+definitive claim is Elo at time control via the CCC harness (actual games), not
+benchmark nps — this nps parity says the backend is ready for that.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
