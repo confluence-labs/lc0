@@ -34,8 +34,11 @@ __global__ void k_fromheads(half_t* o,const half_t* in,int H,int hd){ int n=bloc
 
 int main(int argc,char** argv){
   int B = argc>1?atoi(argv[1]):256;         // boards (leaf batch)
-  int L=15,d=1024,H=32,hd=32,dff=1280,ed=512;
-  int E = argc>2?atoi(argv[2]):13;          // expert count (hero5 sweep: 13/28/45/64/96/128)
+  int hd=32;
+  int d = argc>2?atoi(argv[2]):1024;        // model width (BT3~768, BT4~1024, hero5 sweeps bigger)
+  int L = argc>3?atoi(argv[3]):15;          // layers (depth)
+  int E = argc>4?atoi(argv[4]):28;          // experts
+  int H=d/hd, dff=(d*5)/4, ed=d/2;          // hero ratios: heads=d/32, dff=1.25d, embed_dff=0.5d
   char name[64]; cudaDeviceProp pr; cudaGetDeviceProperties(&pr,0); snprintf(name,64,"%s",pr.name);
   double peak = strstr(name,"A100")?312e12: strstr(name,"H100")?989e12: strstr(name,"L4")?121e12: strstr(name,"L40")?181e12:100e12;
   cublasHandle_t cub; CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub,CUBLAS_TENSOR_OP_MATH));
@@ -106,7 +109,8 @@ int main(int argc,char** argv){
   cudaEvent_t s0,s1; cudaEventCreate(&s0);cudaEventCreate(&s1);
   int IT=30; cudaEventRecord(s0); for(int i=0;i<IT;i++) fwd(); cudaEventRecord(s1); cudaEventSynchronize(s1);
   float ms; cudaEventElapsedTime(&ms,s0,s1); double per=ms/IT/1000.0;
-  double gflop=13.2; // trunk-only ~ per-pos GFLOP (approx; heads are ~1%)
+  // trunk per-pos GFLOP: L*(qkvo 512 d^2 + FFN 256 d*dff), one active expert/token
+  double gflop=(512.0*d*d + 256.0*(double)d*dff)*L/1e9;
   double posps=B/per, mfu=gflop*1e9*posps/peak;
   double tot=t_attn+t_ffn;
   printf("HERO TRUNK bench: dev=%s B=%d  %.2f ms/fwd  %.0f pos/s  MFU~%.3f (peak %.0f TF)  [attn %.0f%% ffn %.0f%%]\n",
