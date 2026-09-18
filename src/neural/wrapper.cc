@@ -31,6 +31,7 @@
 #include <numeric>
 
 #include "neural/encoder.h"
+#include "neural/hero/hero_weights.h"
 #include "neural/shared_params.h"
 #include "utils/atomic_vector.h"
 #include "utils/fastmath.h"
@@ -189,7 +190,13 @@ std::unique_ptr<Backend> NetworkAsBackendFactory::Create(
   std::string net_path =
       options.Get<std::string>(SharedBackendParams::kWeightsId);
   std::optional<WeightsFile> weights = LoadWeights(net_path);
-  network_options.Set<std::string>(SharedBackendParams::kWeightsId, net_path);
+  // Hero .htw nets carry no WeightsFile (LoadWeights returns nullopt), so the
+  // hero backend reads the path from this injected option. Inject it ONLY for
+  // hero nets — other backends never read it, and CheckAllOptionsRead below
+  // would otherwise throw "Unknown string option" (their weights come via the
+  // WeightsFile arg). This is what blocked --backend=cuda-fp16.
+  if (hero::IsHeroWeightsFile(net_path))
+    network_options.Set<std::string>(SharedBackendParams::kWeightsId, net_path);
   std::unique_ptr<Network> network =
       factory_(std::move(weights), network_options);
   network_options.CheckAllOptionsRead(name_);
