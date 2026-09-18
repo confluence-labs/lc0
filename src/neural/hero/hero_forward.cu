@@ -66,6 +66,20 @@ static void gemm_i8(cublasHandle_t h,int m,int n,int k,const int8_t* A,int lda,c
   int32_t a=1,b=0;
   CB(cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,m,n,k,&a,A,CUDA_R_8I,lda,B,CUDA_R_8I,ldb,&b,C,CUDA_R_32I,ldc,CUBLAS_COMPUTE_32I,CUBLAS_GEMM_DEFAULT));
 }
+// SmoothQuant: migrate per-input-channel scale s = amax(act)^.5 / amax(w)^.5 into the
+// weights (W'=W*s), quantize per-out-channel, and emit the 1/s activation prescale.
+static void sq_quant(const float* w, size_t outC, int inC, const float* Achan,
+                     int8_t** d_i8, float** d_inv, float** d_sqinv){
+  std::vector<float> Wcol(inC,0.f);
+  for(size_t o=0;o<outC;o++){ const float* wr=w+o*inC; for(int j=0;j<inC;j++) Wcol[j]=fmaxf(Wcol[j],fabsf(wr[j])); }
+  std::vector<float> s(inC), sqinv(inC);
+  for(int j=0;j<inC;j++){ float a=Achan[j],wc=Wcol[j]; float sj=(a>0&&wc>0)?sqrtf(a)/sqrtf(wc):1.f;
+    sj=fmaxf(1e-2f,fminf(1e2f,sj)); s[j]=sj; sqinv[j]=1.f/sj; }
+  std::vector<float> Wp(outC*inC);
+  for(size_t o=0;o<outC;o++)for(int j=0;j<inC;j++) Wp[o*inC+j]=w[o*inC+j]*s[j];
+  quant_chan(Wp.data(),outC,inC,d_i8,d_inv);
+  CK(cudaMalloc(d_sqinv,inC*sizeof(float))); CK(cudaMemcpy(*d_sqinv,sqinv.data(),inC*sizeof(float),cudaMemcpyHostToDevice));
+}
 
 static std::vector<std::vector<float>> geo_basis() {
   std::vector<std::vector<float>> g(18, std::vector<float>(4096));
@@ -154,17 +168,23 @@ __global__ void k_hist(const int* route,int* cnt,int R){ int r=blockIdx.x*blockD
 __global__ void k_scatter_order(const int* route,int* cur,int* order,int R){ int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R){ int p=atomicAdd(&cur[route[r]],1); order[p]=r; } }
 
 // ---- int8 quantization helpers (INC int8-A: FFN gemms) ----
-// per-row dynamic quant of a [rows,K] fp16 matrix -> int8 + per-row inv-scale (amax/127)
-__global__ void k_quant_rows(const half_t* x, int8_t* xq, float* ainv, int rows, int K){
+// per-row dynamic quant of a [rows,K] fp16 matrix -> int8 + per-row inv-scale (amax/127).
+// `pre` (nullptr or per-channel): SmoothQuant activation smoothing x[j] *= pre[j] first.
+__global__ void k_quant_rows(const half_t* x, int8_t* xq, float* ainv, int rows, int K, const float* pre){
   int r=blockIdx.x; if(r>=rows) return;
   const half_t* xr=x+(size_t)r*K; int8_t* qr=xq+(size_t)r*K;
   __shared__ float sm[256]; float amax=0;
-  for(int j=threadIdx.x;j<K;j+=blockDim.x) amax=fmaxf(amax,fabsf(__half2float(xr[j])));
+  for(int j=threadIdx.x;j<K;j+=blockDim.x){ float v=__half2float(xr[j])*(pre?pre[j]:1.f); amax=fmaxf(amax,fabsf(v)); }
   sm[threadIdx.x]=amax; __syncthreads();
   for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s) sm[threadIdx.x]=fmaxf(sm[threadIdx.x],sm[threadIdx.x+s]); __syncthreads(); }
   float mx=sm[0]; float sc = mx>0? 127.f/mx : 0.f;
   if(threadIdx.x==0) ainv[r] = mx>0? mx/127.f : 0.f;
-  for(int j=threadIdx.x;j<K;j+=blockDim.x){ int v=__float2int_rn(__half2float(xr[j])*sc); qr[j]=(int8_t)max(-127,min(127,v)); }
+  for(int j=threadIdx.x;j<K;j+=blockDim.x){ float v=__half2float(xr[j])*(pre?pre[j]:1.f); int q=__float2int_rn(v*sc); qr[j]=(int8_t)max(-127,min(127,q)); }
+}
+// calibration: accumulate per-channel abs-max over rows (SmoothQuant activation stats)
+__global__ void k_chan_absmax(const half_t* x, float* out, int rows, int K){
+  int j=blockIdx.x*blockDim.x+threadIdx.x; if(j>=K) return;
+  float m=out[j]; for(int r=0;r<rows;r++) m=fmaxf(m,fabsf(__half2float(x[(size_t)r*K+j]))); out[j]=m;
 }
 // dequant int32 gemm output C[out,rows] (col-major, ld=out) with per-out-channel wcol_inv
 // and per-row ainv; optional mish. writes fp16 in the same [out,rows] layout.
@@ -186,11 +206,15 @@ struct HeroForward::Impl {
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
   const bool int8 = getenv("HERO_INT8") != nullptr;   // INC int8-A: int8 FFN gemms
+  const bool calib = getenv("HERO_CALIB") != nullptr; // collect per-channel act stats
+  const bool sq = getenv("HERO_SQ") != nullptr;       // apply SmoothQuant (needs HERO_SQ_FILE)
+  float *calib_up=nullptr,*calib_dn=nullptr;          // [L*d],[L*dff] activation abs-max
 
   // ---- weights (device, uploaded once) ----
   half_t *pp0,*pp1,*emb,*eln,*eu,*edn,*efln,*zbuf;
   struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias;   // bias: (H,64,64) fp16
-              int8_t *up_i8=nullptr,*dn_i8=nullptr; float *up_inv=nullptr,*dn_inv=nullptr; };
+              int8_t *up_i8=nullptr,*dn_i8=nullptr; float *up_inv=nullptr,*dn_inv=nullptr;
+              float *sq_up_inv=nullptr,*sq_dn_inv=nullptr; };   // SmoothQuant 1/s prescales
   std::vector<LW> lw;
   // head weights (device, uploaded once) + policy-promotion + gather map
   half_t *h_pe,*h_peb,*h_pq,*h_pqb,*h_pk,*h_pkb,*h_ve,*h_vq,*h_vk,*h_vv,*h_ppo;
@@ -216,14 +240,31 @@ struct HeroForward::Impl {
     eu=up_f(w.embed_up_w); edn=up_f(w.embed_down_w); efln=up_f(w.embed_ffn_ln_g);
     std::vector<float> zeros((d>dff?d:dff),0.f); zbuf=up_f(zeros);
     auto geo = geo_basis();
+    // SmoothQuant: load per-input-channel activation abs-max (calibration) once
+    std::vector<float> cal_up, cal_dn;
+    if (sq) {
+      const char* cf=getenv("HERO_SQ_FILE"); FILE* f=cf?fopen(cf,"rb"):nullptr;
+      if(!f){ fprintf(stderr,"HERO_SQ set but HERO_SQ_FILE missing\n"); exit(1); }
+      cal_up.resize((size_t)L*d); cal_dn.resize((size_t)L*dff);
+      if(fread(cal_up.data(),sizeof(float),cal_up.size(),f)!=cal_up.size()||
+         fread(cal_dn.data(),sizeof(float),cal_dn.size(),f)!=cal_dn.size()){ fprintf(stderr,"short calib file\n"); exit(1); }
+      fclose(f);
+    }
+    if (calib) { CK(cudaMalloc(&calib_up,(size_t)L*d*sizeof(float))); CK(cudaMemset(calib_up,0,(size_t)L*d*sizeof(float)));
+                 CK(cudaMalloc(&calib_dn,(size_t)L*dff*sizeof(float))); CK(cudaMemset(calib_dn,0,(size_t)L*dff*sizeof(float))); }
     lw.resize(L);
     for (int li=0; li<L; li++) {
       auto& s=w.layer[li]; auto& t=lw[li];
       t.qw=up_f(s.q_w); t.kw=up_f(s.k_w); t.vw=up_f(s.v_w); t.ow=up_f(s.out_w);
       t.l1g=up_f(s.ln1_g); t.l2g=up_f(s.ln2_g);
       if (int8) {  // per-output-channel int8 for the whole expert bank; free the fp16 copies
-        quant_chan(s.ffn_up.data(),   (size_t)E*dff, d,   &t.up_i8, &t.up_inv);
-        quant_chan(s.ffn_down.data(), (size_t)E*d,   dff, &t.dn_i8, &t.dn_inv);
+        if (sq) {
+          sq_quant(s.ffn_up.data(),  (size_t)E*dff,d, cal_up.data()+(size_t)li*d,   &t.up_i8,&t.up_inv,&t.sq_up_inv);
+          sq_quant(s.ffn_down.data(),(size_t)E*d, dff,cal_dn.data()+(size_t)li*dff, &t.dn_i8,&t.dn_inv,&t.sq_dn_inv);
+        } else {
+          quant_chan(s.ffn_up.data(),   (size_t)E*dff, d,   &t.up_i8, &t.up_inv);
+          quant_chan(s.ffn_down.data(), (size_t)E*d,   dff, &t.dn_i8, &t.dn_inv);
+        }
         t.up=t.dn=nullptr;
       } else { t.up=up_f(s.ffn_up); t.dn=up_f(s.ffn_down); }
       std::vector<float> bias_hhh((size_t)H*64*64, 0.f);   // free + alpha_mix . geo (once)
@@ -408,13 +449,14 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, I.dBias, N, H, hd, 0);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
+    if (I.calib) k_chan_absmax<<<(d+255)/256,256>>>(I.xa,I.calib_up+(size_t)li*d,R,d);   // up-input stats
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
-    if (I.int8) {   // int8 expert gemms: quant -> int8 gemm (int32 acc) -> dequant(+mish)
-      k_quant_rows<<<R,256>>>(I.xs,I.xs_i8,I.xrow_inv,R,d);
+    if (I.int8) {   // int8 expert gemms: (SmoothQuant prescale->)quant -> int8 gemm -> dequant(+mish)
+      k_quant_rows<<<R,256>>>(I.xs,I.xs_i8,I.xrow_inv,R,d,t.sq_up_inv);
       for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue; size_t oo=off[e];
         gemm_i8(cub,dff,m,d, t.up_i8+(size_t)e*dff*d,d, I.xs_i8+oo*d,d, I.ffgh_i32+oo*dff,dff);
         k_dequant<<<dim3((dff+255)/256,m),256>>>(I.ffgh_i32+oo*dff,I.ffgh+oo*dff,t.up_inv+(size_t)e*dff,I.xrow_inv+oo,dff,m,1);
-        k_quant_rows<<<m,256>>>(I.ffgh+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,m,dff);
+        k_quant_rows<<<m,256>>>(I.ffgh+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,m,dff,t.sq_dn_inv);
         gemm_i8(cub,d,m,dff, t.dn_i8+(size_t)e*d*dff,dff, I.gh_i8+oo*dff,dff, I.ys_i32+oo*d,d);
         k_dequant<<<dim3((d+255)/256,m),256>>>(I.ys_i32+oo*d,I.ys+oo*d,t.dn_inv+(size_t)e*d,I.ghrow_inv+oo,d,m,0); }
     } else {
@@ -423,6 +465,7 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
         addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,0);
         gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
     }
+    if (I.calib) k_chan_absmax<<<(dff+255)/256,256>>>(I.ffgh,I.calib_dn+(size_t)li*dff,R,dff);   // down-input stats
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
   }
@@ -471,6 +514,15 @@ void HeroForward::DebugRoute(const float* planes_nchw, int N, std::vector<int>& 
   k_route_id<<<dim3(N,1),64>>>(I.dPiece,I.dAtt_o,I.dAtt_t,I.dRoute,N);
   CK(cudaDeviceSynchronize());
   out.resize(R); CK(cudaMemcpy(out.data(),I.dRoute,R*sizeof(int),cudaMemcpyDeviceToHost));
+}
+
+void HeroForward::WriteCalib(const char* path) {
+  Impl& I=*p_; if(!I.calib_up){ fprintf(stderr,"WriteCalib: not in calib mode\n"); return; }
+  std::vector<float> up((size_t)I.L*I.d), dn((size_t)I.L*I.dff);
+  CK(cudaMemcpy(up.data(),I.calib_up,up.size()*sizeof(float),cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(dn.data(),I.calib_dn,dn.size()*sizeof(float),cudaMemcpyDeviceToHost));
+  FILE* f=fopen(path,"wb"); fwrite(up.data(),sizeof(float),up.size(),f); fwrite(dn.data(),sizeof(float),dn.size(),f); fclose(f);
+  fprintf(stderr,"WriteCalib: wrote %s (L=%d d=%d dff=%d)\n",path,I.L,I.d,I.dff);
 }
 
 }  // namespace hero

@@ -27,6 +27,10 @@ class HeroForward {
   // expert ids [N*64] (for bit-exact validation vs the oracle route). 28-class path.
   void DebugRoute(const float* planes_nchw, int N, std::vector<int>& out);
 
+  // test-only: dump per-layer per-channel activation abs-max (HERO_CALIB run) for
+  // SmoothQuant. File layout: L*d floats (up-input) then L*dff floats (down-input).
+  void WriteCalib(const char* path);
+
  private:
   struct Impl;
   Impl* p_;

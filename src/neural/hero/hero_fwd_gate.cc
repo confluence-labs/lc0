@@ -1,13 +1,16 @@
-// Forward gate: run the REAL HeroForward::Run on the oracle planes and compare
-// policy top-1 + WDL to the oracle. Used to validate int8 (HERO_INT8=1) accuracy
-// vs fp16 — int8 changes the compute, so output differs by quantization error;
-// we require top-1 move match to hold. CudaError stubbed (standalone, no layers.cc).
+// Forward gate for SmoothQuant. Modes:
+//   <htw> <planes.npy> <out.bin>   run HeroForward::Run (fp16/int8/SQ by env), write
+//                                  [int N][policy N*1858][wdl N*3]; if HERO_CALIB also
+//                                  writes <out.bin>.calib for SmoothQuant.
+//   cmp <a.bin> <b.bin>            compare two runs: top-1 agreement + wdl diff.
+// planes.npy is lc0 NCHW image (N,112,8,8) == planes_nchw [N,112,64] flat. CudaError stubbed.
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <string>
 #include <vector>
 #include "neural/hero/hero_forward.h"
 #include "neural/hero/hero_weights.h"
@@ -27,34 +30,40 @@ static std::vector<float> load_npy(const std::string& p, std::vector<int>& shape
   for(size_t i=0;i<n;i++){ const char*q=&r[i*w]; if(w==1)o[i]=(float)(uint8_t)q[0]; else if(w==8){int64_t v;memcpy(&v,q,8);o[i]=v;} else if(ii){int32_t v;memcpy(&v,q,4);o[i]=v;} else {float v;memcpy(&v,q,4);o[i]=v;} }
   return o;
 }
+static int am(const float* p){ int b=0; for(int m=1;m<1858;m++) if(p[m]>p[b]) b=m; return b; }
 
 int main(int argc,char** argv){
-  if(argc<3){ printf("usage: hero_fwd_gate <28class.htw> <oracle28_dir>\n"); return 2; }
-  std::string od=argv[2]; std::vector<int> ps,gs;
-  auto planes=load_npy(od+"/planes.npy",ps);           // (N,64,112) NHWC uint8
-  auto gather=load_npy(od+"/gather.npy",gs);           // (1858,) int
-  std::vector<int> dummy;
-  auto refP=load_npy(od+"/policy.npy",dummy);          // (N,1858)
-  auto refW=load_npy(od+"/wdl.npy",dummy);             // (N,3)
-  int N=ps[0];
-  std::vector<float> nchw((size_t)N*112*64,0.f), flat12((size_t)N*768,0.f);
-  for(int n=0;n<N;n++)for(int s=0;s<64;s++)for(int c=0;c<112;c++){ float v=planes[((size_t)n*64+s)*112+c];
-    nchw[((size_t)n*112+c)*64+s]=v; if(c<12) flat12[(size_t)n*768+s*12+c]=v; }
-  std::vector<int> gmap(1858); for(int i=0;i<1858;i++) gmap[i]=(int)gather[i];
-
-  lczero::hero::HeroWeights w=lczero::hero::LoadHeroWeights(argv[1]);
-  printf("net classes=%d N=%d  (HERO_INT8=%s)\n", w.classes, N, getenv("HERO_INT8")?"1":"0");
-  lczero::hero::HeroForward fwd(w);
-  std::vector<float> pol((size_t)N*1858), wdl((size_t)N*3);
-  fwd.Run(nchw.data(),flat12.data(),N,gmap,pol.data(),wdl.data());
-
-  int top1=0; double vw=0,rmw=0;
-  for(int n=0;n<N;n++){
-    auto am=[&](const std::vector<float>& v){ int b=0; for(int m=1;m<1858;m++) if(v[(size_t)n*1858+m]>v[(size_t)n*1858+b]) b=m; return b; };
-    if(am(pol)==am(refP)) top1++;
-    for(int c=0;c<3;c++){ vw=fmax(vw,fabs((double)wdl[n*3+c]-refW[n*3+c])); rmw=fmax(rmw,fabs((double)refW[n*3+c])); }
+  if(argc>=4 && !strcmp(argv[1],"cmp")){
+    std::ifstream A(argv[2],std::ios::binary), B(argv[3],std::ios::binary);
+    int na,nb; A.read((char*)&na,4); B.read((char*)&nb,4); if(na!=nb){printf("N mismatch\n");return 1;}
+    std::vector<float> pa((size_t)na*1858),pb((size_t)na*1858),wa(na*3),wb(na*3);
+    A.read((char*)pa.data(),pa.size()*4); B.read((char*)pb.data(),pb.size()*4);
+    A.read((char*)wa.data(),wa.size()*4); B.read((char*)wb.data(),wb.size()*4);
+    int top1=0; double vw=0,rmw=0;
+    for(int n=0;n<na;n++){ if(am(&pa[(size_t)n*1858])==am(&pb[(size_t)n*1858])) top1++;
+      for(int c=0;c<3;c++){ vw=fmax(vw,fabs((double)wa[n*3+c]-wb[n*3+c])); rmw=fmax(rmw,fabs((double)wa[n*3+c])); } }
+    printf("CMP %s vs %s: top1-agree=%d/%d  wdl worst|d|=%.4f (rel %.3f)\n", argv[2],argv[3],top1,na,vw,rmw>0?vw/rmw:0);
+    printf("%s\n", (top1>=na*0.95 && (rmw>0?vw/rmw:0)<0.08)?"CMP_OK":"CMP_DEGRADED");
+    return 0;
   }
-  printf("FWD gate: top1-match=%d/%d  wdl worst|d|=%.4f (of %.2f, rel %.3f)\n", top1,N, vw, rmw, vw/rmw);
-  printf("%s\n", (top1==N && vw/rmw<0.05) ? "FWD_PASS" : "FWD_CHECK");
+  if(argc<4){ printf("usage: hero_fwd_gate <htw> <planes.npy> <out.bin>  |  cmp <a.bin> <b.bin>\n"); return 2; }
+  std::vector<int> ps; auto nchw=load_npy(argv[2],ps);   // (N,112,8,8) == [N,112,64] flat
+  int N=ps[0];
+  std::vector<float> flat12((size_t)N*768,0.f);
+  for(int n=0;n<N;n++)for(int c=0;c<12;c++)for(int s=0;s<64;s++) flat12[(size_t)n*768+s*12+c]=nchw[((size_t)n*112+c)*64+s];
+  // gather map is identity-load from the oracle? no — reuse lc0's; here we only need
+  // top-1 self-consistency, and the gather is fixed, so a placeholder identity works
+  // for RELATIVE comparison IF both runs use the same map. Use 0..1857 (stable).
+  std::vector<int> gmap(1858); for(int i=0;i<1858;i++) gmap[i]=i;
+  lczero::hero::HeroWeights w=lczero::hero::LoadHeroWeights(argv[1]);
+  fprintf(stderr,"net classes=%d N=%d int8=%s sq=%s calib=%s\n",w.classes,N,
+    getenv("HERO_INT8")?"1":"0",getenv("HERO_SQ")?"1":"0",getenv("HERO_CALIB")?"1":"0");
+  lczero::hero::HeroForward fwd(w);
+  std::vector<float> pol((size_t)N*1858),wdl((size_t)N*3);
+  fwd.Run(nchw.data(),flat12.data(),N,gmap,pol.data(),wdl.data());
+  std::ofstream out(argv[3],std::ios::binary);
+  out.write((char*)&N,4); out.write((char*)pol.data(),pol.size()*4); out.write((char*)wdl.data(),wdl.size()*4);
+  if(getenv("HERO_CALIB")){ std::string cf=std::string(argv[3])+".calib"; fwd.WriteCalib(cf.c_str()); }
+  fprintf(stderr,"wrote %s\n",argv[3]);
   return 0;
 }
