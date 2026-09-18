@@ -190,6 +190,22 @@ __global__ void k_chan_absmax(const half_t* x, float* out, int rows, int K){
   int j=blockIdx.x*blockDim.x+threadIdx.x; if(j>=K) return;
   float m=out[j]; for(int r=0;r<rows;r++) m=fmaxf(m,fabsf(__half2float(x[(size_t)r*K+j]))); out[j]=m;
 }
+// FUSED dequant(int32)->mish->per-row requant(int8): reads the up-gemm int32 accum once,
+// writes int8 once (halves the fp16 round-trip of separate dequant+requant). `pre` = SQ 1/s.
+__global__ void k_dq_mish_q(const int32_t* c, int8_t* q, float* rowinv, const float* wcol_inv,
+                            const float* ainv, const float* pre, int K, int rows){
+  extern __shared__ float sm[];   // K floats: the mished row
+  int r=blockIdx.x; if(r>=rows) return; const int32_t* cr=c+(size_t)r*K; float ar=ainv[r];
+  float amax=0;
+  for(int j=threadIdx.x;j<K;j+=blockDim.x){
+    float v=(float)cr[j]*wcol_inv[j]*ar; float sp=v>20.f?v:logf(1.f+expf(v)); v=v*tanhf(sp);
+    if(pre) v*=pre[j]; sm[j]=v; amax=fmaxf(amax,fabsf(v)); }
+  __shared__ float red[256]; red[threadIdx.x]=amax; __syncthreads();
+  for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s) red[threadIdx.x]=fmaxf(red[threadIdx.x],red[threadIdx.x+s]); __syncthreads(); }
+  float mx=red[0], sc=mx>0?127.f/mx:0.f; if(threadIdx.x==0) rowinv[r]=mx>0?mx/127.f:0.f;
+  int8_t* qr=q+(size_t)r*K;
+  for(int j=threadIdx.x;j<K;j+=blockDim.x){ int qq=__float2int_rn(sm[j]*sc); qr[j]=(int8_t)max(-127,min(127,qq)); }
+}
 // dequant int32 gemm output C[out,rows] (col-major, ld=out) with per-out-channel wcol_inv
 // and per-row ainv; optional mish. writes fp16 in the same [out,rows] layout.
 __global__ void k_dequant(const int32_t* c, half_t* out, const float* wcol_inv, const float* ainv, int outC, int rows, int mish){
@@ -468,8 +484,7 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
         cudaStreamWaitEvent(st, I.ev_gather, 0);
         cublasSetStream(cub, st);
         gemm_i8(cub,dff,m,d, t.up_i8+(size_t)e*dff*d,d, I.xs_i8+oo*d,d, I.ffgh_i32+oo*dff,dff);
-        k_dequant<<<dim3((dff+255)/256,m),256,0,st>>>(I.ffgh_i32+oo*dff,I.ffgh+oo*dff,t.up_inv+(size_t)e*dff,I.xrow_inv+oo,dff,m,1);
-        k_quant_rows<<<m,256,0,st>>>(I.ffgh+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,m,dff,t.sq_dn_inv);
+        k_dq_mish_q<<<m,256,dff*sizeof(float),st>>>(I.ffgh_i32+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,t.up_inv+(size_t)e*dff,I.xrow_inv+oo,t.sq_dn_inv,dff,m);
         gemm_i8(cub,d,m,dff, t.dn_i8+(size_t)e*d*dff,dff, I.gh_i8+oo*dff,dff, I.ys_i32+oo*d,d);
         k_dequant<<<dim3((d+255)/256,m),256,0,st>>>(I.ys_i32+oo*d,I.ys+oo*d,t.dn_inv+(size_t)e*d,I.ghrow_inv+oo,d,m,0); }
       for (int s=0;s<Impl::NS;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
