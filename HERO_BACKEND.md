@@ -252,6 +252,21 @@ realizes the ~2x the data-parallel test PROVES. So on CCC/TCEC 2xA100 hero runs 
 neutral vs BT4, but doubles absolute nps (more Elo vs Stockfish / deeper search).
 THE biggest speed lever, and it's the actual competition hardware.
 
+**ENGINE-FILL PROFILE (2026-09-18): GPU only ~65% utilized during search — a
+~1.5x recoverable win, and it's BACKEND-side.** lc0 benchmark (real MCTS) on the
+real 1B net: engine nps ~13-14k (cache-inflated above the ~8k forward), but GPU
+util stuck at 64-65% across ALL configs (threads 2/4/8/12, mb 256/384/512). More
+threads DON'T raise util -> not a leaf-collection problem, it's STRUCTURAL: the
+per-batch search overhead (select+backprop) + my forward's HOST bits (InputPlanes
+expansion in ComputeBlocking, policy/WDL D2H copy) + the mutex serializing eval
+none overlap the GPU compute -> GPU idles ~35% between batches. FIX (my lane):
+async/pipelined eval — overlap host input-prep + D2H with compute, double-buffer
+so batch N+1 uploads while batch N computes, instead of the mutex serializing.
+~65%->~90%+ util = the ~1.5x. CAVEAT: benchmark runs many SHORT searches (fresh
+tree per position -> warmup idle); real-game (one persistent tree) util is likely
+higher, so confirm with a long single-position `go movetime` before over-claiming.
+THE biggest fresh backend lever found — bigger than any remaining kernel tweak.
+
 CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there). Large batch declines but
 hero STILL runs there at ~8k where BT4 OOMs (zero) — so hero wins at EVERY batch:
 faster at bs512-1024, only-option at bs2048+. Cause of the decline is academic to
