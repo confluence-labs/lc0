@@ -39,22 +39,28 @@
 namespace lczero {
 namespace NS_BACKEND {
 
-// mish(x) = x * tanh(softplus(x)); CUTLASS epilogue activation functor
-template <typename T, int N>
+// mish(x) = x * tanh(softplus(x)); CUTLASS epilogue activation functor.
+// Primary handles scalar ElementCompute; the Array specialization handles the
+// FragmentCompute (LinearCombinationGeneric instantiates both).
+template <typename T>
 struct MishActivation {
+  static const bool kIsHeavy = true;
+  CUTLASS_HOST_DEVICE T operator()(T const& value) const {
+    float v = float(value); float sp = v > 20.f ? v : logf(1.f + expf(v));
+    return T(v * tanhf(sp));
+  }
+};
+template <typename T, int N>
+struct MishActivation<cutlass::Array<T, N>> {
+  static const bool kIsHeavy = true;
   CUTLASS_HOST_DEVICE cutlass::Array<T, N> operator()(cutlass::Array<T, N> const& x) const {
     cutlass::Array<T, N> y;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < N; ++i) {
-      float v = float(x[i]);
-      float sp = v > 20.f ? v : logf(1.f + expf(v));
+      float v = float(x[i]); float sp = v > 20.f ? v : logf(1.f + expf(v));
       y[i] = T(v * tanhf(sp));
     }
     return y;
-  }
-  CUTLASS_HOST_DEVICE T operator()(T const& s) const {
-    float v = float(s); float sp = v > 20.f ? v : logf(1.f + expf(v));
-    return T(v * tanhf(sp));
   }
 };
 
