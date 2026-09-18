@@ -130,6 +130,9 @@ struct HeroForward::Impl {
   static const int NS = 8;    // max streams allocated for concurrent expert FFN
   int nsUse = NS;             // active count (env HERO_FFN_STREAMS, 1..NS) — for
                              // the serial-vs-streamed large-batch A/B test
+  bool prof = false;         // HERO_PROFILE: split-time the forward's components
+  cudaEvent_t pe[6];
+  double tqkv=0,tmha=0,tout=0,tffn=0,tln=0; int pcalls=0;
   cudaStream_t streams[NS];   // experts are independent; run them in parallel
   cudaEvent_t ev_gather, ev_done[NS];
   std::mutex mtx;             // lc0 calls ComputeBlocking from multiple search
@@ -163,6 +166,8 @@ struct HeroForward::Impl {
     for (int s=0;s<NS;s++){ cudaStreamCreate(&streams[s]); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
     cudaEventCreateWithFlags(&ev_gather,cudaEventDisableTiming);
     if (const char* e=getenv("HERO_FFN_STREAMS")){ nsUse=atoi(e); if(nsUse<1)nsUse=1; if(nsUse>NS)nsUse=NS; }
+    prof = getenv("HERO_PROFILE")!=nullptr;
+    for (int i=0;i<6;i++) cudaEventCreate(&pe[i]);
     pp0=up_f(w.preproc0_w); pp1=up_f(w.preproc1_w); emb=up_f(w.embed_w); eln=up_f(w.embed_ln_g);
     eu=up_f(w.embed_up_w); edn=up_f(w.embed_down_w); efln=up_f(w.embed_ffn_ln_g);
     std::vector<float> zeros((d>dff?d:dff),0.f); zbuf=up_f(zeros);
@@ -272,14 +277,18 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   dim3 gd(R,(d+255)/256);
   for (int li=0; li<I.L; li++){
     auto& t=I.lw[li];
+    if(I.prof)cudaEventRecord(I.pe[0],0);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,d);
+    if(I.prof)cudaEventRecord(I.pe[1],0);
     // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
     // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
     fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
+    if(I.prof)cudaEventRecord(I.pe[2],0);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
+    if(I.prof)cudaEventRecord(I.pe[3],0);
     // expert FFN: gather (default stream) -> per-expert up/mish/down run
     // CONCURRENTLY across NS streams (experts are independent) -> scatter.
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
@@ -294,7 +303,20 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     for (int s=0;s<I.nsUse;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
     cublasSetStream(cub, 0);                             // back to default; scatter after all experts
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
+    if(I.prof)cudaEventRecord(I.pe[4],0);
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
+    if(I.prof){ cudaEventRecord(I.pe[5],0); cudaEventSynchronize(I.pe[5]); float a;
+      cudaEventElapsedTime(&a,I.pe[0],I.pe[1]); I.tqkv+=a;   // 3 qkv projection gemms
+      cudaEventElapsedTime(&a,I.pe[1],I.pe[2]); I.tmha+=a;   // fusedMHA
+      cudaEventElapsedTime(&a,I.pe[2],I.pe[3]); I.tout+=a;   // out gemm + LN1
+      cudaEventElapsedTime(&a,I.pe[3],I.pe[4]); I.tffn+=a;   // gather + experts + scatter
+      cudaEventElapsedTime(&a,I.pe[4],I.pe[5]); I.tln+=a; }  // LN2
+  }
+  if(I.prof && (++I.pcalls)%20==0){
+    double tot=I.tqkv+I.tmha+I.tout+I.tffn+I.tln;
+    printf("PROFILE bs=%d over 20x15 layers: qkv=%.0f%% mha=%.0f%% out+ln1=%.0f%% ffn=%.0f%% ln2=%.0f%%  (tot %.1fms/20fwd)\n",
+      N,100*I.tqkv/tot,100*I.tmha/tot,100*I.tout/tot,100*I.tffn/tot,100*I.tln/tot,tot/1.0);
+    fflush(stdout); I.tqkv=I.tmha=I.tout=I.tffn=I.tln=0;
   }
 
   // ---- heads (fully device-resident) ----
