@@ -107,11 +107,15 @@ static std::vector<std::vector<float>> geo_basis() {
   return g;
 }
 
-// device kernels: FFN gather/scatter (rows pre-sorted by expert) + bias broadcast
+// device kernels: FFN gather/scatter (rows pre-sorted by expert). Vectorized to
+// 16-byte (int4 = 8xhalf) loads — d is a multiple of 8 for all hero configs, so
+// every row offset is 16-byte aligned. Bit-identical to per-half, ~8x bandwidth.
 __global__ void k_gather(half_t* o,const half_t* in,const int* idx,int d){
-  int r=blockIdx.x,c=blockIdx.y*blockDim.x+threadIdx.x; if(c<d) o[(size_t)r*d+c]=in[(size_t)idx[r]*d+c]; }
+  int r=blockIdx.x, c8=blockIdx.y*blockDim.x+threadIdx.x, d8=d>>3;
+  if(c8<d8) ((int4*)o)[(size_t)r*d8+c8]=((const int4*)in)[(size_t)idx[r]*d8+c8]; }
 __global__ void k_scatter(half_t* o,const half_t* in,const int* idx,int d){
-  int r=blockIdx.x,c=blockIdx.y*blockDim.x+threadIdx.x; if(c<d) o[(size_t)idx[r]*d+c]=in[(size_t)r*d+c]; }
+  int r=blockIdx.x, c8=blockIdx.y*blockDim.x+threadIdx.x, d8=d>>3;
+  if(c8<d8) ((int4*)o)[(size_t)idx[r]*d8+c8]=((const int4*)in)[(size_t)r*d8+c8]; }
 // broadcast per-head bias (H,64,64) -> (N,H,64,64) for fusedMHA (batch-independent)
 __global__ void k_bcast_bias(half_t* o,const half_t* b,int HB){  // HB = H*64*64
   int n=blockIdx.y, x=blockIdx.x*blockDim.x+threadIdx.x; if(x<HB) o[(size_t)n*HB+x]=b[x]; }
@@ -442,7 +446,7 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   if (prof) cudaEventRecord(Er,0);   // route done
 
   // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
-  dim3 gd(R,(d+255)/256);
+  dim3 gd(R,((d>>3)+255)/256);   // int4-vectorized gather/scatter (8 halfs/thread)
   for (int li=0; li<I.L; li++){
     auto& t=I.lw[li];
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,d);
