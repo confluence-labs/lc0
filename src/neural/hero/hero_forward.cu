@@ -133,6 +133,14 @@ struct HeroForward::Impl {
   bool prof = false;         // HERO_PROFILE: split-time the forward's components
   cudaEvent_t pe[6];
   double tqkv=0,tmha=0,tout=0,tffn=0,tln=0; int pcalls=0;
+  // grouped-GEMM FFN (HERO_FFN_GROUPED, default on): all E experts in 2 batched
+  // calls instead of the 13-way multi-stream loop. Host arrays sized to E.
+  bool grouped = true;
+  std::vector<int> gM,gRows,gK,gLdA,gLdB,gLdC,gSz;
+  std::vector<cublasOperation_t> gTA,gTB;
+  std::vector<float> gAlpha,gBeta;
+  std::vector<const void*> gUpA,gUpB,gDnA,gDnB;
+  std::vector<void*> gUpC,gDnC;
   cudaStream_t streams[NS];   // experts are independent; run them in parallel
   cudaEvent_t ev_gather, ev_done[NS];
   std::mutex mtx;             // lc0 calls ComputeBlocking from multiple search
@@ -168,6 +176,11 @@ struct HeroForward::Impl {
     if (const char* e=getenv("HERO_FFN_STREAMS")){ nsUse=atoi(e); if(nsUse<1)nsUse=1; if(nsUse>NS)nsUse=NS; }
     prof = getenv("HERO_PROFILE")!=nullptr;
     for (int i=0;i<6;i++) cudaEventCreate(&pe[i]);
+    if (const char* e=getenv("HERO_FFN_GROUPED")) grouped = atoi(e)!=0;
+    gM.resize(E); gRows.resize(E); gK.resize(E); gLdA.resize(E); gLdB.resize(E); gLdC.resize(E);
+    gSz.assign(E,1); gTA.assign(E,CUBLAS_OP_T); gTB.assign(E,CUBLAS_OP_N);
+    gAlpha.assign(E,1.f); gBeta.assign(E,0.f);
+    gUpA.resize(E);gUpB.resize(E);gUpC.resize(E);gDnA.resize(E);gDnB.resize(E);gDnC.resize(E);
     pp0=up_f(w.preproc0_w); pp1=up_f(w.preproc1_w); emb=up_f(w.embed_w); eln=up_f(w.embed_ln_g);
     eu=up_f(w.embed_up_w); edn=up_f(w.embed_down_w); efln=up_f(w.embed_ffn_ln_g);
     std::vector<float> zeros((d>dff?d:dff),0.f); zbuf=up_f(zeros);
@@ -292,16 +305,37 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     // expert FFN: gather (default stream) -> per-expert up/mish/down run
     // CONCURRENTLY across NS streams (experts are independent) -> scatter.
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
-    cudaEventRecord(I.ev_gather, 0);
-    for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
-      cudaStream_t st=I.streams[e % I.nsUse];
-      cudaStreamWaitEvent(st, I.ev_gather, 0);          // each expert waits for the gather
-      cublasSetStream(cub, st);
-      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
-      addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
-      gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
-    for (int s=0;s<I.nsUse;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
-    cublasSetStream(cub, 0);                             // back to default; scatter after all experts
+    if (I.grouped) {
+      // all experts in ONE up-gemm + ONE fused mish + ONE down-gemm
+      int ng=0;
+      for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
+        I.gRows[ng]=m;
+        I.gUpA[ng]=t.up+(size_t)e*dff*d; I.gUpB[ng]=I.xs+(size_t)off[e]*d; I.gUpC[ng]=I.ffgh+(size_t)off[e]*dff;
+        I.gDnA[ng]=t.dn+(size_t)e*d*dff; I.gDnB[ng]=I.ffgh+(size_t)off[e]*dff; I.gDnC[ng]=I.ys+(size_t)off[e]*d;
+        ng++; }
+      // up: C[dff x m] = up[dff x d]^T @ xs[d x m];  lda=d ldb=d ldc=dff
+      for(int i=0;i<ng;i++){ I.gM[i]=dff; I.gK[i]=d; I.gLdA[i]=d; I.gLdB[i]=d; I.gLdC[i]=dff; }
+      CB(cublasGemmGroupedBatchedEx(cub, I.gTA.data(),I.gTB.data(), I.gM.data(),I.gRows.data(),I.gK.data(),
+          I.gAlpha.data(), I.gUpA.data(),CUDA_R_16F,I.gLdA.data(), I.gUpB.data(),CUDA_R_16F,I.gLdB.data(),
+          I.gBeta.data(), I.gUpC.data(),CUDA_R_16F,I.gLdC.data(), ng, I.gSz.data(), CUBLAS_COMPUTE_32F));
+      addBiasBatched<half_t>(I.ffgh,I.ffgh,I.zbuf,1,R,dff,ACTIVATION_MISH,0);   // one mish over all gathered rows
+      // down: C[d x m] = dn[d x dff]^T @ ffgh[dff x m];  lda=dff ldb=dff ldc=d
+      for(int i=0;i<ng;i++){ I.gM[i]=d; I.gK[i]=dff; I.gLdA[i]=dff; I.gLdB[i]=dff; I.gLdC[i]=d; }
+      CB(cublasGemmGroupedBatchedEx(cub, I.gTA.data(),I.gTB.data(), I.gM.data(),I.gRows.data(),I.gK.data(),
+          I.gAlpha.data(), I.gDnA.data(),CUDA_R_16F,I.gLdA.data(), I.gDnB.data(),CUDA_R_16F,I.gLdB.data(),
+          I.gBeta.data(), I.gDnC.data(),CUDA_R_16F,I.gLdC.data(), ng, I.gSz.data(), CUBLAS_COMPUTE_32F));
+    } else {
+      cudaEventRecord(I.ev_gather, 0);
+      for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
+        cudaStream_t st=I.streams[e % I.nsUse];
+        cudaStreamWaitEvent(st, I.ev_gather, 0);
+        cublasSetStream(cub, st);
+        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
+        addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
+        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
+      for (int s=0;s<I.nsUse;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
+      cublasSetStream(cub, 0);
+    }
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
     if(I.prof)cudaEventRecord(I.pe[4],0);
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
