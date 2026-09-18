@@ -34,7 +34,8 @@ __global__ void k_fromheads(half_t* o,const half_t* in,int H,int hd){ int n=bloc
 
 int main(int argc,char** argv){
   int B = argc>1?atoi(argv[1]):256;         // boards (leaf batch)
-  int L=15,d=1024,H=32,hd=32,dff=1280,E=13,ed=512;
+  int L=15,d=1024,H=32,hd=32,dff=1280,ed=512;
+  int E = argc>2?atoi(argv[2]):13;          // expert count (hero5 sweep: 13/28/45/64/96/128)
   char name[64]; cudaDeviceProp pr; cudaGetDeviceProperties(&pr,0); snprintf(name,64,"%s",pr.name);
   double peak = strstr(name,"A100")?312e12: strstr(name,"H100")?989e12: strstr(name,"L4")?121e12: strstr(name,"L40")?181e12:100e12;
   cublasHandle_t cub; CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub,CUBLAS_TENSOR_OP_MATH));
