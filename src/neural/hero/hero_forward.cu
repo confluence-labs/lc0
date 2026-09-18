@@ -200,31 +200,35 @@ struct HeroForward::Impl {
   // Host-side per batch (cheap vs the trunk); planes[n,c,s] channels 0..5 ours
   // P/N/B/R/Q/K, 6..11 theirs.
   void route28(const float* pl, int N, std::vector<int>& route) {
+    // precomputed target LISTS (<=8 per piece) instead of 64-wide masks; skip
+    // empty from-squares. ~8x fewer inner iterations than the mask version.
     static bool init=false;
-    static bool knight[64][64],king[64][64],pw_ours[64][64],pw_theirs[64][64];
+    static int kn_t[64][8],kn_n[64], kg_t[64][8],kg_n[64], pwo_t[64][2],pwo_n[64], pwt_t[64][2],pwt_n[64];
     static const int rays[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
     if(!init){ init=true;
-      for(int a=0;a<64;a++)for(int t=0;t<64;t++){
-        int ra=a/8,fa=a%8,rt=t/8,ft=t%8,dR=rt-ra,aF=abs(ft-fa),aR=abs(rt-ra);
-        knight[a][t]=((aR==2&&aF==1)||(aR==1&&aF==2));
-        king[a][t]=(std::max(aR,aF)==1);
-        pw_ours[a][t]=(dR==1&&aF==1); pw_theirs[a][t]=(dR==-1&&aF==1);
-      } }
+      for(int a=0;a<64;a++){ kn_n[a]=kg_n[a]=pwo_n[a]=pwt_n[a]=0;
+        for(int t=0;t<64;t++){
+          int ra=a/8,fa=a%8,rt=t/8,ft=t%8,dR=rt-ra,aF=abs(ft-fa),aR=abs(rt-ra);
+          if((aR==2&&aF==1)||(aR==1&&aF==2)) kn_t[a][kn_n[a]++]=t;
+          if(std::max(aR,aF)==1) kg_t[a][kg_n[a]++]=t;
+          if(dR==1&&aF==1) pwo_t[a][pwo_n[a]++]=t;
+          if(dR==-1&&aF==1) pwt_t[a][pwt_n[a]++]=t;
+        } } }
     route.assign((size_t)N*64,0);
     auto Pn=[&](int n,int c,int s){ return pl[((size_t)n*112+c)*64+s]>0.f; };
     for(int n=0;n<N;n++){
       bool occ[64]; for(int s=0;s<64;s++){ occ[s]=false; for(int c=0;c<12;c++) if(Pn(n,c,s)){occ[s]=true;break;} }
       int att_ours[64]={0}, att_theirs[64]={0};
-      for(int from=0;from<64;from++) for(int side=0;side<2;side++){ int off=side*6;
-        int* att = side==0?att_ours:att_theirs;
-        if(Pn(n,off+0,from)) for(int t=0;t<64;t++){ if(side==0?pw_ours[from][t]:pw_theirs[from][t]) att[t]=1; }
-        if(Pn(n,off+1,from)) for(int t=0;t<64;t++){ if(knight[from][t]) att[t]=1; }
-        if(Pn(n,off+5,from)) for(int t=0;t<64;t++){ if(king[from][t]) att[t]=1; }
-        bool bi=Pn(n,off+2,from), rk=Pn(n,off+3,from), qn=Pn(n,off+4,from);
-        if(bi||rk||qn) for(int d=0;d<8;d++){ bool orth=d<4; if(!(orth?(rk||qn):(bi||qn))) continue;
-          int rr=from/8, ff=from%8;
-          for(int k=0;k<7;k++){ rr+=rays[d][0]; ff+=rays[d][1]; if(rr<0||rr>7||ff<0||ff>7) break; int t=rr*8+ff; att[t]=1; if(occ[t]) break; } }
-      }
+      for(int from=0;from<64;from++){ if(!occ[from]) continue;   // empty squares attack nothing
+        for(int side=0;side<2;side++){ int off=side*6; int* att=side==0?att_ours:att_theirs;
+          if(Pn(n,off+0,from)){ int* pt=side==0?pwo_t[from]:pwt_t[from]; int pn=side==0?pwo_n[from]:pwt_n[from]; for(int i=0;i<pn;i++) att[pt[i]]=1; }
+          if(Pn(n,off+1,from)) for(int i=0;i<kn_n[from];i++) att[kn_t[from][i]]=1;
+          if(Pn(n,off+5,from)) for(int i=0;i<kg_n[from];i++) att[kg_t[from][i]]=1;
+          bool bi=Pn(n,off+2,from), rk=Pn(n,off+3,from), qn=Pn(n,off+4,from);
+          if(bi||rk||qn) for(int d=0;d<8;d++){ bool orth=d<4; if(!(orth?(rk||qn):(bi||qn))) continue;
+            int rr=from/8, ff=from%8;
+            for(int k=0;k<7;k++){ rr+=rays[d][0]; ff+=rays[d][1]; if(rr<0||rr>7||ff<0||ff>7) break; int t=rr*8+ff; att[t]=1; if(occ[t]) break; } }
+        } }
       for(int s=0;s<64;s++){
         int piece=0; float bv=0; for(int c=0;c<12;c++){ float v=pl[((size_t)n*112+c)*64+s]; if(v>0&&(piece==0||v>bv)){bv=v;piece=c+1;} }
         int rv; if(piece==0) rv=att_ours[s]+2*att_theirs[s];
