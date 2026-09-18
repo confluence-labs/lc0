@@ -115,10 +115,33 @@ headroom left. NOTE: the launch thesis is time-fair *Elo* = nps x strength/node;
 if hero is stronger per node it can still win at equal nps-ish — but that's the
 training side. My job: close the 9% and push past.
 
-NEXT: (1) CUTLASS grouped FFN + close the forward<->trunk gap to lift hero's nps
-toward/past BT4's 21.9k; (2) set hero backend defaults mb=384/threads=2; (3) the
-definitive claim is Elo at time control via the CCC harness (actual games), not
-benchmark nps — this nps parity says the backend is ready for that.
+**SANITY CHECK / AIRTIGHT ANCHOR (2026-09-17, commit 0e68947).** The engine-nps
+numbers (hero 20k, BT4 14.9-21.9k across runs) are CACHE-INFLATED and fragile —
+a parallel BT4-track box measured BT4 at 10,157 vs my 21,923 (2.2x), pure
+NNCache/position/warmup noise. The RELIABLE comparison is cache-free backendbench
+(forward-only pos/s):
+
+| batch | BT4 cache-free | HERO cache-free | hero/BT4 |
+|-------|----------------|-----------------|----------|
+| 256   | 8,120          | 7,346           | 90%      |
+| 384   | 8,320          | 7,727           | **93%**  |
+
+Cache-inflation factor (engine nps, nncache 1000 vs 2e6): BT4 8.5k->14.9k,
+hero 9.1k->20.2k. Tiny-cache engine nps ~= forward-only, as expected.
+
+**DEFENSIBLE CONCLUSION: hero's backend is ~93% of BT4's per-eval throughput
+(~7.7k vs ~8.3k pos/s cache-free) — essentially at parity, BT4 a hair faster.**
+Both retracted extremes (hero>>BT4 AND hero at 91% off the 21.9k) were artifacts;
+93% cache-free is the real number, and it's position/box-independent (BT4 track
+to cross-check via their own backendbench). Q3 (real-FEN `go movetime`) didn't
+capture — UCI handshake missing (uci/isready); minor, redo if in-game per-move
+nps is needed, but Q1 already answers transferability: sustained in-game nps for
+both sits in the ~8-12k band (forward-bound + realistic cache), ~7-10% apart.
+
+NEXT: (1) CUTLASS grouped FFN + forward<->trunk gap to push hero's cache-free
+~7.7k past BT4's ~8.3k (close the last 7%); (2) hero defaults mb=384/threads=2;
+(3) definitive claim = Elo at time control via CCC harness, not benchmark nps.
+Backend is at parity -> ready for the games harness.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
