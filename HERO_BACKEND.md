@@ -154,10 +154,30 @@ as predicted (BT4 track: grouped-FFN ~modest). Hero now at ~parity, a hair behin
 gap narrows with batch. Remaining gap = host route-sort (per-batch sync) + heads +
 fundamental MoE-dispatch/d1024-width vs BT4 d768. Diminishing returns from here.
 
-NEXT (small levers, optional): (1) device-side route-sort to drop the last host
-sync; (2) true cuBLAS grouped-batched-Ex or CUTLASS grouped GEMM (vs multi-stream)
-— marginal. (3) hero defaults mb=384/threads=2. THE claim is Elo at time control
-via CCC harness, not nps — backend is at parity, READY for the games harness.
+**int8 RULED OUT (2026-09-17):** cuBLAS int8 on hero's gemm shapes is only
+1.23-1.31x over fp16 (not 2x) — nets to ~1.15x end-to-end. Not worth the accuracy
+risk on a chess net. Dead lever.
+
+**LARGE-BATCH REGIME (Niranjan: inference batch is unlimited). Raised the 1024
+caps (backendbench + bridge maximum_batch_size). Cache-free forward pos/s:**
+
+| batch | HERO  | BT4        |
+|-------|-------|------------|
+| 512   | 8,182 | 8,353      |
+| 1024  | 8,334 | 8,580 (pk) |
+| 2048  | 7,542 | OOM        |
+| 4096  | 7,574 | OOM        |
+| 8192  | 7,366 | OOM        |
+
+TWO findings: (1) BT4's cuda backend OOMs at bs>=2048 — it CANNOT run large batch
+on 40GB. Hero can. (2) Hero DEGRADES past bs=1024 (8,334->7,542) instead of
+holding the ~10.7k the trunk bench proved possible — host-side overhead dominates
+at large batch: the host route-sort (O(N)) AND re-broadcasting the per-head bias
+(N,H,64,64) EVERY layer for fusedMHA (~8GB writes/fwd at bs2048, pure waste since
+bias is batch-independent). THE LEVER: fix hero's large-batch scaling -> it holds
+high throughput at bs2048-8192 where BT4 physically can't run -> decisive win.
+This is the real speed play (not int8). NEXT: (1) make fusedMHA read a batch-
+broadcast bias (strideB=0, no per-layer N-broadcast); (2) device-side route-sort.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
