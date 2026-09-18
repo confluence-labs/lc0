@@ -176,8 +176,28 @@ at large batch: the host route-sort (O(N)) AND re-broadcasting the per-head bias
 (N,H,64,64) EVERY layer for fusedMHA (~8GB writes/fwd at bs2048, pure waste since
 bias is batch-independent). THE LEVER: fix hero's large-batch scaling -> it holds
 high throughput at bs2048-8192 where BT4 physically can't run -> decisive win.
-This is the real speed play (not int8). NEXT: (1) make fusedMHA read a batch-
-broadcast bias (strideB=0, no per-layer N-broadcast); (2) device-side route-sort.
+This is the real speed play (not int8).
+
+**BROADCAST-BIAS FIX SHIPPED (2026-09-17, commit bf99321): HERO NOW BEATS BT4.**
+Added fusedMHA `broadcast_bias` (strideB=0) so hero's static (H,64,64) bias is
+read for all N — no per-layer N-broadcast write, dropped the dBias buffer. +5-6%
+across batch, still plays b4f4 (strideB=0 correct). Cache-free forward:
+
+| batch | HERO pre | HERO post | BT4        |
+|-------|----------|-----------|------------|
+| 512   | 8,182    | 8,714     | 8,353      |
+| 1024  | 8,334    | **8,797** | 8,580 (pk) |
+| 2048  | 7,542    | 7,859     | OOM        |
+| 8192  | 7,366    | 7,624     | OOM        |
+| 12288 | -        | 7,482     | OOM        |
+
+**At bs=1024 (shared peak) HERO 8,797 > BT4 8,580 — ~2.5% faster, and correct.**
+First time hero leads on a clean cache-free measurement. Hero also runs bs>=2048
+(to 12288+) where BT4 OOMs. REMAINING: hero still degrades past bs=1024 (host
+route13 argmax O(N*64*12) stops overlapping the stem at large batch) — device-
+side route kernel would hold ~8.8k into the bs2048-12288 regime BT4 can't enter,
+extending the lead. NEXT: (1) same-box side-by-side confirm (airtight the claim);
+(2) device route13 kernel for large-batch scaling.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
