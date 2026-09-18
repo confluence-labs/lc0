@@ -35,10 +35,12 @@ __global__ void k_fromheads(half_t* o,const half_t* in,int H,int hd){ int n=bloc
 int main(int argc,char** argv){
   int B = argc>1?atoi(argv[1]):256;         // boards (leaf batch)
   int hd=32;
-  int d = argc>2?atoi(argv[2]):1024;        // model width (BT3~768, BT4~1024, hero5 sweeps bigger)
+  int d = argc>2?atoi(argv[2]):1024;        // model width (hero3=1024, hero4=1280)
   int L = argc>3?atoi(argv[3]):15;          // layers (depth)
-  int E = argc>4?atoi(argv[4]):28;          // experts
-  int H=d/hd, dff=(d*5)/4, ed=d/2;          // hero ratios: heads=d/32, dff=1.25d, embed_dff=0.5d
+  int E = argc>4?atoi(argv[4]):13;          // experts
+  int dff = argc>5?atoi(argv[5]):(d*5)/4;   // FFN width (hero3=1280, hero4=2048); default 1.25d
+  int H=d/hd, ed=d/2;                       // heads=d/32, embed_dff=0.5d
+  double actM = L*(4.0*d*d + 2.0*(double)d*dff)/1e6;  // ~active params (M): attn 4d^2 + 1 expert 2*d*dff
   char name[64]; cudaDeviceProp pr; cudaGetDeviceProperties(&pr,0); snprintf(name,64,"%s",pr.name);
   double peak = strstr(name,"A100")?312e12: strstr(name,"H100")?989e12: strstr(name,"L4")?121e12: strstr(name,"L40")?181e12:100e12;
   cublasHandle_t cub; CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub,CUBLAS_TENSOR_OP_MATH));
@@ -113,7 +115,7 @@ int main(int argc,char** argv){
   double gflop=(512.0*d*d + 256.0*(double)d*dff)*L/1e9;
   double posps=B/per, mfu=gflop*1e9*posps/peak;
   double tot=t_attn+t_ffn;
-  printf("HERO TRUNK bench: dev=%s B=%d  %.2f ms/fwd  %.0f pos/s  MFU~%.3f (peak %.0f TF)  [attn %.0f%% ffn %.0f%%]\n",
-         name,B,per*1000,posps,mfu,peak/1e12, 100*t_attn/tot, 100*t_ffn/tot);
+  printf("HERO TRUNK bench: dev=%s d=%d dff=%d H=%d L=%d E=%d act~%.0fM B=%d  %.2f ms/fwd  %.0f pos/s  MFU~%.3f  [attn %.0f%% ffn %.0f%%]\n",
+         name,d,dff,H,L,E,actM,B,per*1000,posps,mfu, 100*t_attn/tot, 100*t_ffn/tot);
   printf("BENCH_DONE\n"); return 0;
 }
