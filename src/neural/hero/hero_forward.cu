@@ -459,14 +459,21 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
     if (I.calib) k_chan_absmax<<<(d+255)/256,256>>>(I.xa,I.calib_up+(size_t)li*d,R,d);   // up-input stats
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
-    if (I.int8) {   // int8 expert gemms (serial; int8 shelved — SQ prescale->quant->int8 gemm->dequant)
-      k_quant_rows<<<R,256>>>(I.xs,I.xs_i8,I.xrow_inv,R,d,t.sq_up_inv);
+    if (I.int8) {   // int8 experts on NS streams — quant/dequant of one expert overlaps the
+                    // int8 gemm of another (the v1 fix: v1 was serial, so overhead wasn't hidden)
+      k_quant_rows<<<R,256>>>(I.xs,I.xs_i8,I.xrow_inv,R,d,t.sq_up_inv);   // hoisted input quant (default stream)
+      cudaEventRecord(I.ev_gather, 0);
       for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue; size_t oo=off[e];
+        cudaStream_t st=I.streams[e % Impl::NS];
+        cudaStreamWaitEvent(st, I.ev_gather, 0);
+        cublasSetStream(cub, st);
         gemm_i8(cub,dff,m,d, t.up_i8+(size_t)e*dff*d,d, I.xs_i8+oo*d,d, I.ffgh_i32+oo*dff,dff);
-        k_dequant<<<dim3((dff+255)/256,m),256>>>(I.ffgh_i32+oo*dff,I.ffgh+oo*dff,t.up_inv+(size_t)e*dff,I.xrow_inv+oo,dff,m,1);
-        k_quant_rows<<<m,256>>>(I.ffgh+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,m,dff,t.sq_dn_inv);
+        k_dequant<<<dim3((dff+255)/256,m),256,0,st>>>(I.ffgh_i32+oo*dff,I.ffgh+oo*dff,t.up_inv+(size_t)e*dff,I.xrow_inv+oo,dff,m,1);
+        k_quant_rows<<<m,256,0,st>>>(I.ffgh+oo*dff,I.gh_i8+oo*dff,I.ghrow_inv+oo,m,dff,t.sq_dn_inv);
         gemm_i8(cub,d,m,dff, t.dn_i8+(size_t)e*d*dff,dff, I.gh_i8+oo*dff,dff, I.ys_i32+oo*d,d);
-        k_dequant<<<dim3((d+255)/256,m),256>>>(I.ys_i32+oo*d,I.ys+oo*d,t.dn_inv+(size_t)e*d,I.ghrow_inv+oo,d,m,0); }
+        k_dequant<<<dim3((d+255)/256,m),256,0,st>>>(I.ys_i32+oo*d,I.ys+oo*d,t.dn_inv+(size_t)e*d,I.ghrow_inv+oo,d,m,0); }
+      for (int s=0;s<Impl::NS;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
+      cublasSetStream(cub, 0);
     } else {   // fp16 experts run CONCURRENTLY across NS streams (independent) — key for hero5 scaling
       cudaEventRecord(I.ev_gather, 0);
       for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
