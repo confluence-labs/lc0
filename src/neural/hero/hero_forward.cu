@@ -108,6 +108,37 @@ __global__ void k_wdl_mean(float* wdl,const half_t* vout,int N){
   float s=0; for(int i=0;i<64;i++) s+=__half2float(vout[((size_t)n*64+i)*3+c]);
   wdl[(size_t)n*3+c]=s/64.f; }
 
+// ---- device 28-class routing (mirrors route28() host logic, bit-exact) ----
+// occ + piece(argmax) per square, from dPlanes [N,112,64] fp16 (NCHW)
+__global__ void k_occ_piece(const half_t* pl, uint8_t* occ, uint8_t* piece, int N){
+  int n=blockIdx.x, s=blockIdx.y*blockDim.x+threadIdx.x; if(s>=64) return;
+  int pc=0; float bv=0; bool any=false;
+  for(int c=0;c<12;c++){ float v=__half2float(pl[((size_t)n*112+c)*64+s]); if(v>0.f){any=true; if(pc==0||v>bv){bv=v;pc=c+1;}} }
+  size_t i=(size_t)n*64+s; occ[i]=any?1:0; piece[i]=(uint8_t)pc; }
+// attackers: one thread per (n,from), scatter attacks PER SET PLANE (matches the
+// reference on random planes where a square may set >1 channel). att_* pre-zeroed.
+__global__ void k_attackers(const half_t* pl,const uint8_t* occ,uint8_t* att_o,uint8_t* att_t,int N){
+  int n=blockIdx.x, from=blockIdx.y*blockDim.x+threadIdx.x; if(from>=64) return;
+  const half_t* P=pl+(size_t)n*112*64; auto has=[&](int c){ return __half2float(P[c*64+from])>0.f; };
+  int fr=from/8, ff=from%8; const uint8_t* occn=occ+(size_t)n*64;
+  const int rd[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+  for(int side=0;side<2;side++){ int off=side*6; uint8_t* attn=(side==0?att_o:att_t)+(size_t)n*64;
+    if(has(off+0)){ int dr=side==0?1:-1; for(int df=-1;df<=1;df+=2){int rr=fr+dr,cc=ff+df; if(rr>=0&&rr<8&&cc>=0&&cc<8) attn[rr*8+cc]=1;} }
+    if(has(off+1)){ const int kd[8][2]={{2,1},{2,-1},{-2,1},{-2,-1},{1,2},{1,-2},{-1,2},{-1,-2}};
+      for(int k=0;k<8;k++){int rr=fr+kd[k][0],cc=ff+kd[k][1]; if(rr>=0&&rr<8&&cc>=0&&cc<8) attn[rr*8+cc]=1;} }
+    if(has(off+5)) for(int dr=-1;dr<=1;dr++)for(int dc=-1;dc<=1;dc++){ if(!dr&&!dc)continue; int rr=fr+dr,cc=ff+dc; if(rr>=0&&rr<8&&cc>=0&&cc<8) attn[rr*8+cc]=1; }
+    bool bi=has(off+2),rk=has(off+3),qn=has(off+4);
+    if(bi||rk||qn) for(int d=0;d<8;d++){ bool orth=d<4; if(!(orth?(rk||qn):(bi||qn))) continue; int rr=fr,cc=ff;
+      for(int k=0;k<7;k++){ rr+=rd[d][0]; cc+=rd[d][1]; if(rr<0||rr>7||cc<0||cc>7)break; int t=rr*8+cc; attn[t]=1; if(occn[t])break; } } } }
+// route id from piece + attacker bits
+__global__ void k_route_id(const uint8_t* piece,const uint8_t* att_o,const uint8_t* att_t,int* route,int N){
+  int n=blockIdx.x, s=blockIdx.y*blockDim.x+threadIdx.x; if(s>=64) return;
+  size_t i=(size_t)n*64+s; int pc=piece[i],ao=att_o[i],at=att_t[i];
+  route[i]= pc==0 ? ao+2*at : 4+(pc-1)+12*((pc<=6)?at:ao); }
+// counting sort: histogram, then scatter rows into expert-contiguous order
+__global__ void k_hist(const int* route,int* cnt,int R){ int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R) atomicAdd(&cnt[route[r]],1); }
+__global__ void k_scatter_order(const int* route,int* cur,int* order,int R){ int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R){ int p=atomicAdd(&cur[route[r]],1); order[p]=r; } }
+
 // ============================ the forward object ============================
 struct HeroForward::Impl {
   HeroWeights w;               // host weights kept only for head-side host math
@@ -134,6 +165,8 @@ struct HeroForward::Impl {
   half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
   float *d_pol,*d_wdl;
   int *dOrder;
+  // device-route scratch
+  uint8_t *dOcc,*dPiece,*dAtt_o,*dAtt_t; int *dRoute,*dCnt,*dCur;
 
   Impl(const HeroWeights& wt) : w(wt) {
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
@@ -182,6 +215,10 @@ struct HeroForward::Impl {
     A(&vvh,R*3); A(&scv,(size_t)N*4096); A(&vout,R*3);
     CK(cudaMalloc(&dOrder,R*sizeof(int)));
     CK(cudaMalloc(&d_pol,(size_t)N*1858*sizeof(float))); CK(cudaMalloc(&d_wdl,(size_t)N*3*sizeof(float)));
+    if (capN) { cudaFree(dOcc);cudaFree(dPiece);cudaFree(dAtt_o);cudaFree(dAtt_t);cudaFree(dRoute); }
+    CK(cudaMalloc(&dOcc,R)); CK(cudaMalloc(&dPiece,R)); CK(cudaMalloc(&dAtt_o,R)); CK(cudaMalloc(&dAtt_t,R));
+    CK(cudaMalloc(&dRoute,R*sizeof(int)));
+    if (!capN) { CK(cudaMalloc(&dCnt,(E+1)*sizeof(int))); CK(cudaMalloc(&dCur,E*sizeof(int))); }
     capN = N;
   }
 
@@ -286,14 +323,28 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   LayerNorm<half_t>(R,d,I.x,I.dn_h,I.zbuf,I.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
 
   if (prof) cudaEventRecord(Es,0);   // stem done
-  // ---- route (class-count-aware) + host sort -> order/offsets ----
-  std::vector<int> route; I.route(planes_nchw,N,route);
-  std::vector<int> order(R), off(E+1,0), cnt(E,0);
-  for (int r=0;r<R;r++) cnt[route[r]]++;
-  for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
-  { std::vector<int> cur(off.begin(),off.end()-1); for(int r=0;r<R;r++) order[cur[route[r]]++]=r; }
-  CK(cudaMemcpy(I.dOrder,order.data(),R*sizeof(int),cudaMemcpyHostToDevice));
-  if (prof) cudaEventRecord(Er,0);   // route (host stall + dOrder upload) done
+  // ---- route -> expert-contiguous order[] + host offsets[] ----
+  std::vector<int> off(E+1,0);
+  if (E<=13) {   // 13-class: cheap host route (unchanged)
+    std::vector<int> route; I.route(planes_nchw,N,route);
+    std::vector<int> order(R), cnt(E,0);
+    for (int r=0;r<R;r++) cnt[route[r]]++;
+    for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
+    { std::vector<int> cur(off.begin(),off.end()-1); for(int r=0;r<R;r++) order[cur[route[r]]++]=r; }
+    CK(cudaMemcpy(I.dOrder,order.data(),R*sizeof(int),cudaMemcpyHostToDevice));
+  } else {       // 28-class: fully device-resident route + counting sort
+    CK(cudaMemset(I.dAtt_o,0,R)); CK(cudaMemset(I.dAtt_t,0,R));
+    k_occ_piece<<<dim3(N,1),64>>>(I.dPlanes,I.dOcc,I.dPiece,N);
+    k_attackers<<<dim3(N,1),64>>>(I.dPlanes,I.dOcc,I.dAtt_o,I.dAtt_t,N);
+    k_route_id<<<dim3(N,1),64>>>(I.dPiece,I.dAtt_o,I.dAtt_t,I.dRoute,N);
+    CK(cudaMemset(I.dCnt,0,(E+1)*sizeof(int)));
+    k_hist<<<(R+255)/256,256>>>(I.dRoute,I.dCnt,R);
+    std::vector<int> cnt(E); CK(cudaMemcpy(cnt.data(),I.dCnt,E*sizeof(int),cudaMemcpyDeviceToHost));
+    for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
+    CK(cudaMemcpy(I.dCur,off.data(),E*sizeof(int),cudaMemcpyHostToDevice));   // cur = start offsets
+    k_scatter_order<<<(R+255)/256,256>>>(I.dRoute,I.dCur,I.dOrder,R);
+  }
+  if (prof) cudaEventRecord(Er,0);   // route done
 
   // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
   dim3 gd(R,(d+255)/256);
@@ -348,6 +399,19 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
       N, a_stem/c, a_route/c, a_trunk/c, a_heads/c, (a_stem+a_route+a_trunk+a_heads)/c); }
   CK(cudaMemcpy(policy_out,I.d_pol,(size_t)N*1858*sizeof(float),cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(wdl_out,I.d_wdl,(size_t)N*3*sizeof(float),cudaMemcpyDeviceToHost));
+}
+
+void HeroForward::DebugRoute(const float* planes_nchw, int N, std::vector<int>& out) {
+  Impl& I=*p_; std::lock_guard<std::mutex> lk(I.mtx); I.ensure(N); const int R=N*64;
+  float* tmp; CK(cudaMalloc(&tmp,(size_t)N*112*64*sizeof(float)));
+  CK(cudaMemcpy(tmp,planes_nchw,(size_t)N*112*64*sizeof(float),cudaMemcpyHostToDevice));
+  copyTypeConverted(I.dPlanes,tmp,(int)((size_t)N*112*64),0); CK(cudaFree(tmp));
+  CK(cudaMemset(I.dAtt_o,0,R)); CK(cudaMemset(I.dAtt_t,0,R));
+  k_occ_piece<<<dim3(N,1),64>>>(I.dPlanes,I.dOcc,I.dPiece,N);
+  k_attackers<<<dim3(N,1),64>>>(I.dPlanes,I.dOcc,I.dAtt_o,I.dAtt_t,N);
+  k_route_id<<<dim3(N,1),64>>>(I.dPiece,I.dAtt_o,I.dAtt_t,I.dRoute,N);
+  CK(cudaDeviceSynchronize());
+  out.resize(R); CK(cudaMemcpy(out.data(),I.dRoute,R*sizeof(int),cudaMemcpyDeviceToHost));
 }
 
 }  // namespace hero

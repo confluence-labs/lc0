@@ -23,6 +23,10 @@ class HeroForward {
   void Run(const float* planes_nchw, const float* flat12, int N,
            const std::vector<int>& gather, float* policy_out, float* wdl_out);
 
+  // test-only: run the device route kernels on planes_nchw and return the per-square
+  // expert ids [N*64] (for bit-exact validation vs the oracle route). 28-class path.
+  void DebugRoute(const float* planes_nchw, int N, std::vector<int>& out);
+
  private:
   struct Impl;
   Impl* p_;
