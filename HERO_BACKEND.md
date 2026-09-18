@@ -138,10 +138,26 @@ capture — UCI handshake missing (uci/isready); minor, redo if in-game per-move
 nps is needed, but Q1 already answers transferability: sustained in-game nps for
 both sits in the ~8-12k band (forward-bound + realistic cache), ~7-10% apart.
 
-NEXT: (1) CUTLASS grouped FFN + forward<->trunk gap to push hero's cache-free
-~7.7k past BT4's ~8.3k (close the last 7%); (2) hero defaults mb=384/threads=2;
-(3) definitive claim = Elo at time control via CCC harness, not benchmark nps.
-Backend is at parity -> ready for the games harness.
+**GROUPED-FFN via MULTI-STREAM (2026-09-17, commit 10a57b4): +3-5%, hero now
+~95-98% of BT4.** Ran the E experts CONCURRENTLY across 8 CUDA streams (they're
+mutually independent) instead of the serial per-expert loop, event-synced around
+gather/scatter. Cache-free backendbench:
+
+| batch | before | after | BT4   | hero/BT4 |
+|-------|--------|-------|-------|----------|
+| 256   | 7,346  | 7,712 | 8,072 | 95.5%    |
+| 384   | 7,727  | 7,939 | 8,320 | 95.4%    |
+| 512   | -      | 8,171 | 8,368 | 97.6%    |
+
+Engine still plays b4f4 -> multi-stream sync correct, no corruption. Modest lever
+as predicted (BT4 track: grouped-FFN ~modest). Hero now at ~parity, a hair behind,
+gap narrows with batch. Remaining gap = host route-sort (per-batch sync) + heads +
+fundamental MoE-dispatch/d1024-width vs BT4 d768. Diminishing returns from here.
+
+NEXT (small levers, optional): (1) device-side route-sort to drop the last host
+sync; (2) true cuBLAS grouped-batched-Ex or CUTLASS grouped GEMM (vs multi-stream)
+— marginal. (3) hero defaults mb=384/threads=2. THE claim is Elo at time control
+via CCC harness, not nps — backend is at parity, READY for the games harness.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
