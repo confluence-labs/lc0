@@ -240,6 +240,18 @@ So the multi-stream FFN is NOT the large-batch bottleneck (my guess was WRONG).
 The bs1024->2048 decline (~15%) is inherent forward compute/memory scaling, cause
 still unpinned (needs component split-timing: attention vs FFN-gemm vs bandwidth).
 
+**MULTI-GPU (2026-09-18, Lambda 8xA100, hero gpu-option commit): NEAR-LINEAR.**
+Added a `gpu` option + cudaSetDevice to hero (mirrors cuda backend). Data-parallel
+(one hero per GPU, split the leaf batch): 1GPU 9,704 -> 2GPU 19,312 (1.99x) ->
+4GPU 38,268 (3.94x). The `multiplexing` backend LOADS hero on both GPUs cleanly.
+Note: `backendbench --backend=multiplexing` shows only 1x (9,744) — a HARNESS
+artifact (backendbench submits serially, so multiplexing never has 2 requests to
+spread); the real MCTS engine submits concurrently from many search threads, so it
+realizes the ~2x the data-parallel test PROVES. So on CCC/TCEC 2xA100 hero runs at
+~2x single-GPU (~17-19k pos/s). Caveat: BT4 also 2x (both multiplex) -> relative-
+neutral vs BT4, but doubles absolute nps (more Elo vs Stockfish / deeper search).
+THE biggest speed lever, and it's the actual competition hardware.
+
 CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there). Large batch declines but
 hero STILL runs there at ~8k where BT4 OOMs (zero) — so hero wins at EVERY batch:
 faster at bs512-1024, only-option at bs2048+. Cause of the decline is academic to
