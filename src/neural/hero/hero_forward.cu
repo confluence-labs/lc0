@@ -111,9 +111,12 @@ __global__ void k_wdl_mean(float* wdl,const half_t* vout,int N){
 struct HeroForward::Impl {
   HeroWeights w;               // host weights kept only for head-side host math
   cublasHandle_t cub;
-  std::mutex mtx;              // lc0 calls ComputeBlocking from multiple search
-                              // threads; one GPU -> serialize the forward (leaf
-                              // collection still runs parallel on the CPU side)
+  static const int NS = 8;    // streams for concurrent expert FFN (experts are
+  cudaStream_t streams[NS];   // mutually independent; run them in parallel
+  cudaEvent_t ev_gather, ev_done[NS];
+  std::mutex mtx;             // lc0 calls ComputeBlocking from multiple search
+                             // threads; one GPU -> serialize the forward (leaf
+                             // collection still runs parallel on the CPU side)
   int d, L, H, hd, dff, E, ed, pd;
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
@@ -138,6 +141,8 @@ struct HeroForward::Impl {
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
     alpha = powf(2.f*L, -0.25f);
     CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH));
+    for (int s=0;s<NS;s++){ cudaStreamCreate(&streams[s]); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
+    cudaEventCreateWithFlags(&ev_gather,cudaEventDisableTiming);
     pp0=up_f(w.preproc0_w); pp1=up_f(w.preproc1_w); emb=up_f(w.embed_w); eln=up_f(w.embed_ln_g);
     eu=up_f(w.embed_up_w); edn=up_f(w.embed_down_w); efln=up_f(w.embed_ffn_ln_g);
     std::vector<float> zeros((d>dff?d:dff),0.f); zbuf=up_f(zeros);
@@ -253,11 +258,19 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, I.dBias, N, H, hd, 0);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
+    // expert FFN: gather (default stream) -> per-expert up/mish/down run
+    // CONCURRENTLY across NS streams (experts are independent) -> scatter.
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
+    cudaEventRecord(I.ev_gather, 0);
     for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
+      cudaStream_t st=I.streams[e % Impl::NS];
+      cudaStreamWaitEvent(st, I.ev_gather, 0);          // each expert waits for the gather
+      cublasSetStream(cub, st);
       gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
-      addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,0);
+      addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
       gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
+    for (int s=0;s<Impl::NS;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
+    cublasSetStream(cub, 0);                             // back to default; scatter after all experts
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
   }
