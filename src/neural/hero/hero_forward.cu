@@ -83,6 +83,22 @@ __global__ void k_gather(half_t* o,const half_t* in,const int* idx,int d){
   int r=blockIdx.x,c=blockIdx.y*blockDim.x+threadIdx.x; if(c<d) o[(size_t)r*d+c]=in[(size_t)idx[r]*d+c]; }
 __global__ void k_scatter(half_t* o,const half_t* in,const int* idx,int d){
   int r=blockIdx.x,c=blockIdx.y*blockDim.x+threadIdx.x; if(c<d) o[(size_t)idx[r]*d+c]=in[(size_t)r*d+c]; }
+// ---- device routing (13-class piece): replaces the host argmax + counting sort
+// (the large-batch bottleneck). planes are fp16 NCHW [N,112,64].
+__global__ void k_route13(int* route,const half_t* planes,int N){
+  int n=blockIdx.x, s=threadIdx.x;  // one block per position, 64 threads (squares)
+  int best=-1; float bv=0.f; bool any=false;
+  for(int c=0;c<12;c++){ float v=__half2float(planes[((size_t)n*112+c)*64+s]);
+    if(v>0.f){any=true; if(best<0||v>bv){bv=v;best=c;}} }
+  route[(size_t)n*64+s] = any? best+1 : 0;
+}
+__global__ void k_hist(int* cnt,const int* route,int R){
+  int r=blockIdx.x*blockDim.x+threadIdx.x; if(r<R) atomicAdd(&cnt[route[r]],1); }
+__global__ void k_offsets(int* off,const int* cnt,int E){  // prefix sum, E tiny
+  if(threadIdx.x) return; off[0]=0; for(int e=0;e<E;e++) off[e+1]=off[e]+cnt[e]; }
+__global__ void k_order(int* order,int* cursor,const int* off,const int* route,int R){
+  int r=blockIdx.x*blockDim.x+threadIdx.x; if(r>=R) return;
+  int e=route[r]; order[off[e]+atomicAdd(&cursor[e],1)]=r; }
 // broadcast per-head bias (H,64,64) -> (N,H,64,64) for fusedMHA (batch-independent)
 __global__ void k_bcast_bias(half_t* o,const half_t* b,int HB){  // HB = H*64*64
   int n=blockIdx.y, x=blockIdx.x*blockDim.x+threadIdx.x; if(x<HB) o[(size_t)n*HB+x]=b[x]; }
@@ -135,7 +151,8 @@ struct HeroForward::Impl {
   // device head scratch
   half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
   float *d_pol,*d_wdl;
-  int *dOrder;
+  int *dOrder,*dRoute;        // per-row (sized to batch)
+  int *dCnt,*dCursor,*dOff;   // per-expert (E), allocated once
 
   Impl(const HeroWeights& wt) : w(wt) {
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
@@ -165,6 +182,7 @@ struct HeroForward::Impl {
     h_pq=up_f(w.pol_q_w); h_pqb=up_f(w.pol_q_b); h_pk=up_f(w.pol_k_w); h_pkb=up_f(w.pol_k_b);
     h_ve=up_f(w.val_embed_w); h_vq=up_f(w.val_q_w); h_vk=up_f(w.val_k_w); h_vv=up_f(w.val_v_w);
     h_ppo=up_f(w.pol_ppo_w);
+    CK(cudaMalloc(&dCnt,E*sizeof(int))); CK(cudaMalloc(&dCursor,E*sizeof(int))); CK(cudaMalloc(&dOff,(E+1)*sizeof(int)));
     ensure(512);   // preallocate for the useful minibatch range (no mid-search realloc)
   }
 
@@ -173,7 +191,7 @@ struct HeroForward::Impl {
     if (capN) { for (half_t* p : {dPlanes,dFlat,pos128,pos8192,cat240,emb_d,e_out,up_h,dn_h,x,
                                    qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,
                                    tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
-                cudaFree(dOrder); cudaFree(d_pol); cudaFree(d_wdl); }
+                cudaFree(dOrder); cudaFree(dRoute); cudaFree(d_pol); cudaFree(d_wdl); }
     const size_t T=(size_t)N*64*d, R=(size_t)N*64;
     auto A=[&](half_t** p,size_t n){ CK(cudaMalloc(p,n*sizeof(half_t))); };
     A(&dPlanes,(size_t)N*112*64); A(&dFlat,(size_t)N*768); A(&pos128,(size_t)N*128);
@@ -183,7 +201,7 @@ struct HeroForward::Impl {
     A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
     A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
     A(&vvh,R*3); A(&scv,(size_t)N*4096); A(&vout,R*3);
-    CK(cudaMalloc(&dOrder,R*sizeof(int)));
+    CK(cudaMalloc(&dOrder,R*sizeof(int))); CK(cudaMalloc(&dRoute,R*sizeof(int)));
     CK(cudaMalloc(&d_pol,(size_t)N*1858*sizeof(float))); CK(cudaMalloc(&d_wdl,(size_t)N*3*sizeof(float)));
     capN = N;
   }
@@ -225,6 +243,16 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     copyTypeConverted(I.dFlat,tmp,(int)((size_t)N*768),0); CK(cudaFree(tmp));
   }
 
+  // ---- device routing (all on GPU; only off[] returns to host to size the
+  // per-expert gemms). Done here so its tiny D2H sync doesn't wait on the stem.
+  std::vector<int> off(E+1);
+  CK(cudaMemset(I.dCnt,0,E*sizeof(int))); CK(cudaMemset(I.dCursor,0,E*sizeof(int)));
+  k_route13<<<N,64>>>(I.dRoute, I.dPlanes, N);
+  k_hist<<<(R+255)/256,256>>>(I.dCnt, I.dRoute, R);
+  k_offsets<<<1,1>>>(I.dOff, I.dCnt, E);
+  k_order<<<(R+255)/256,256>>>(I.dOrder, I.dCursor, I.dOff, I.dRoute, R);
+  CK(cudaMemcpy(off.data(), I.dOff, (E+1)*sizeof(int), cudaMemcpyDeviceToHost));
+
   // ---- stem ----
   gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,128,N,768,1.f,I.pp0,768,I.dFlat,768,0.f,I.pos128,128);
   gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,8192,N,128,1.f,I.pp1,128,I.pos128,128,0.f,I.pos8192,8192);
@@ -237,13 +265,6 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   LayerNorm<half_t>(R,d,I.x,I.dn_h,I.zbuf,I.e_out,I.efln,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
 
   // ---- route + host sort -> order/offsets ----
-  std::vector<int> route; I.route13(planes_nchw,N,route);
-  std::vector<int> order(R), off(E+1,0), cnt(E,0);
-  for (int r=0;r<R;r++) cnt[route[r]]++;
-  for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
-  { std::vector<int> cur(off.begin(),off.end()-1); for(int r=0;r<R;r++) order[cur[route[r]]++]=r; }
-  CK(cudaMemcpy(I.dOrder,order.data(),R*sizeof(int),cudaMemcpyHostToDevice));
-
   // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
   dim3 gd(R,(d+255)/256);
   for (int li=0; li<I.L; li++){
