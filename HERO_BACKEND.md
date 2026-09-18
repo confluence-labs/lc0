@@ -79,11 +79,27 @@ OK. Results on A100 (commit c5b8670):
 Engine (full MCTS benchmark): 53 -> **4,218 nps** (~80x). Still plays b4f4 —
 correctness held (used the validated head math, just on-device).
 
-**REMAINING HEADROOM:** (1) forward 7,344 vs trunk-bench ~10,700 — gap is the
-heads + host route-sort + real-net FFN; (2) engine 4,218 vs forward 7,344 — MCTS
-batch efficiency (MinibatchSize unset -> backend-suggested; NNCache). Next levers
-in priority: tune MinibatchSize/cache for the engine, CUTLASS grouped FFN for the
-trunk, device-side route-sort to drop the last host sync.
+**PERF PASS 3 (engine tuning): 4,218 -> 20,295 nps.** Swept minibatch x threads x
+nncache (commit b77a186, after fixing a thread-safety segfault — HeroForward now
+mutex-serializes the GPU forward across lc0 search threads; preallocate 512;
+GetMiniBatchSize 384). Winner **mb=384, threads=2, nncache=2e6 -> 20,295 nps**;
+mb=384/th4 19,077; th6 18,075; mb=160/th4 18,031. Fewer threads win (mutex means
+extra threads only add contention; GPU is the bottleneck). mb=384 = lc0's proven
+comp range (>384 hurts Elo AND segfaulted pre-fix).
+
+**HONEST CAVEAT on 20,295:** this is engine nps WITH nncache=2e6 on lc0's small
+benchmark suite -> high transposition/cache-hit rate (~55-60% of nodes are cache
+hits, not forwards). It's legit engine nps (cache is part of the engine, and
+BT4's 13,825 reference is also cache-inflated engine nps) BUT the two MUST be
+measured identically before quoting. Cache-independent sustained throughput is
+the forward-only 7,344 pos/s (bs=256). Real-game sustained nps sits between.
+STILL: hero engine nps now exceeds the BT4 13,825 reference under matched-ish
+settings — the launch thesis (small net, fast backend, time-fair parity) is live.
+
+NEXT: (1) measure BT4 the SAME way for the apples-to-apples claim (needs the
+cuda-backend flag bug sorted, or the BT4 track does it); (2) CUTLASS grouped FFN
+to lift the cache-independent forward toward the ~10.7k trunk ceiling; (3) set
+the hero backend defaults to mb=384/threads=2.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
