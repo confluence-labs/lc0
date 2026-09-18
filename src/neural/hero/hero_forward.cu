@@ -222,7 +222,7 @@ struct HeroForward::Impl {
 
   // ---- scratch (device, sized to capN) ----
   half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
-  half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn,*dBias;
+  half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn;
   // device head scratch
   half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
   float *d_pol,*d_wdl;
@@ -286,7 +286,7 @@ struct HeroForward::Impl {
   void ensure(int N) {                 // (re)allocate scratch for batch N
     if (N <= capN) return;
     if (capN) { for (half_t* p : {dPlanes,dFlat,pos128,pos8192,cat240,emb_d,e_out,up_h,dn_h,x,
-                                   qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,dBias,
+                                   qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,
                                    tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
                 cudaFree(dOrder); cudaFree(d_pol); cudaFree(d_wdl); }
     const size_t T=(size_t)N*64*d, R=(size_t)N*64;
@@ -295,7 +295,6 @@ struct HeroForward::Impl {
     A(&pos8192,(size_t)N*8192); A(&cat240,R*240); A(&emb_d,T); A(&e_out,T);
     A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,T); A(&kd,T); A(&vd,T); A(&po,T);
     A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
-    A(&dBias,(size_t)N*H*64*64);
     A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
     A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
     A(&vvh,R*3); A(&scv,(size_t)N*4096); A(&vout,R*3);
@@ -438,15 +437,14 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
 
   // ---- trunk: 15 layers (fusedMHA + gather/scatter expert FFN) ----
   dim3 gd(R,(d+255)/256);
-  const int HB=H*64*64;
-  dim3 bg((HB+255)/256, N);
   for (int li=0; li<I.L; li++){
     auto& t=I.lw[li];
-    k_bcast_bias<<<bg,256>>>(I.dBias, t.bias, HB);      // (H,64,64) -> (N,H,64,64), device only
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,d);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,d);
-    fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, I.dBias, N, H, hd, 0);
+    // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
+    // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
+    fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
     if (I.calib) k_chan_absmax<<<(d+255)/256,256>>>(I.xa,I.calib_up+(size_t)li*d,R,d);   // up-input stats

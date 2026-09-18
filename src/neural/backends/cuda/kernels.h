@@ -166,7 +166,8 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
 
 template <typename DataType>
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
-              int batch_size, int num_heads, int depth, cudaStream_t stream);
+              int batch_size, int num_heads, int depth, cudaStream_t stream,
+              bool broadcast_bias = false);
 
 }  // namespace cudnn_backend
 }  // namespace lczero
