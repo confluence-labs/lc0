@@ -226,12 +226,25 @@ exceed cache) — a fundamental limit, not a fixable overhead. (2) Lambda's A100
 clocks higher than GCP's, so these aren't same-silicon comparable to the 8797 GCP
 peak — can't isolate device-routing's delta without a same-box A/B.
 
-CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there); "unlimited batch" does
-NOT yield more throughput (peaks at 1024, declines after, bandwidth-bound). Large
-batch = "hero CAN run where BT4 OOMs", not "hero faster there". Device routing is
-sound hygiene (kept), not a new win. THE speed headline stands: hero > BT4 at the
-operating batch (bs512-1024), same-box confirmed. Backend work is DONE; claim =
-Elo at TC via CCC harness.
+**STREAM A/B (Lambda A100, commit 99123a1) — REFUTES the multi-stream hypothesis.**
+Swept HERO_FFN_STREAMS=1/4/8 at bs 2048-8192:
+
+| batch | 1 stream | 4 | 8 |
+|-------|----------|------|------|
+| 2048  | 8,429    | 8,546| 8,536|
+| 4096  | 8,439    | 8,486| 8,480|
+| 8192  | 8,102    | 8,142| 8,131|
+
+All within ~1%; more streams marginally FASTER, not slower. b4f4 at every count.
+So the multi-stream FFN is NOT the large-batch bottleneck (my guess was WRONG).
+The bs1024->2048 decline (~15%) is inherent forward compute/memory scaling, cause
+still unpinned (needs component split-timing: attention vs FFN-gemm vs bandwidth).
+
+CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there). Large batch declines but
+hero STILL runs there at ~8k where BT4 OOMs (zero) — so hero wins at EVERY batch:
+faster at bs512-1024, only-option at bs2048+. Cause of the decline is academic to
+the competitive picture. Device routing + streams both kept (correct, ~neutral).
+Backend work DONE; hero > BT4 same-box confirmed; claim = Elo at TC via CCC harness.
 
 Also: `--backend=cuda*` probe fails "Unknown string option: cuda-auto.<garbage>"
 in this fork build (hero backend unaffected — it played). Chase the BT4
