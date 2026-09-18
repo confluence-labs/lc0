@@ -169,5 +169,9 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream,
               bool broadcast_bias = false);
 
+// Hero FFN up-projection with fused mish epilogue (CUTLASS). C[m,dff]=mish(A[m,d]@Wup[dff,d]^T).
+void cutlassFFNUpMish(const void* A, const void* Wup, void* C, int m, int d, int dff,
+                      cudaStream_t stream);
+
 }  // namespace cudnn_backend
 }  // namespace lczero

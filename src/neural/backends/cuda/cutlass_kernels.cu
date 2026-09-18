@@ -31,8 +31,52 @@
 #include "fused_multi_head_attention/kernel_forward.h"
 #include "utils/exception.h"
 
+// Hero FFN fusion: CUTLASS fp16 gemm with a fused mish epilogue (folds the
+// separate addBias-mish kernel into the up-projection gemm — ~5% on hero).
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/linear_combination_generic.h"
+
 namespace lczero {
 namespace NS_BACKEND {
+
+// mish(x) = x * tanh(softplus(x)); CUTLASS epilogue activation functor
+template <typename T, int N>
+struct MishActivation {
+  CUTLASS_HOST_DEVICE cutlass::Array<T, N> operator()(cutlass::Array<T, N> const& x) const {
+    cutlass::Array<T, N> y;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N; ++i) {
+      float v = float(x[i]);
+      float sp = v > 20.f ? v : logf(1.f + expf(v));
+      y[i] = T(v * tanhf(sp));
+    }
+    return y;
+  }
+  CUTLASS_HOST_DEVICE T operator()(T const& s) const {
+    float v = float(s); float sp = v > 20.f ? v : logf(1.f + expf(v));
+    return T(v * tanhf(sp));
+  }
+};
+
+// C[m,dff] = mish(A[m,d] @ Wup[dff,d]^T). Wup viewed ColumnMajor(ld=d) = [d,dff]=Wup^T.
+// Output layout matches the cuBLAS up-gemm (row r's dff values contiguous) so the
+// existing cuBLAS down-gemm reads it unchanged.
+void cutlassFFNUpMish(const void* A, const void* Wup, void* C, int m, int d, int dff,
+                      cudaStream_t stream) {
+  using Elem = cutlass::half_t; using Acc = float;
+  using Epilogue = cutlass::epilogue::thread::LinearCombinationGeneric<
+      MishActivation, Elem, 128 / cutlass::sizeof_bits<Elem>::value, Acc, Acc>;
+  using Gemm = cutlass::gemm::device::Gemm<
+      Elem, cutlass::layout::RowMajor, Elem, cutlass::layout::ColumnMajor,
+      Elem, cutlass::layout::RowMajor, Acc, cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 128, 32>,
+      cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<16, 8, 16>, Epilogue>;
+  Gemm op;
+  typename Gemm::Arguments args({m, dff, d}, {(Elem const*)A, d}, {(Elem const*)Wup, d},
+                                {(Elem*)C, dff}, {(Elem*)C, dff}, {1.f, 0.f});
+  if (op(args, nullptr, stream) != cutlass::Status::kSuccess)
+    throw Exception("cutlassFFNUpMish gemm failed");
+}
 
 template <typename ElementType, bool bias>
 void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,

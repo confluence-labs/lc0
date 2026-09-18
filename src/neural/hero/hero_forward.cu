@@ -211,6 +211,7 @@ struct HeroForward::Impl {
   const bool int8 = getenv("HERO_INT8") != nullptr;   // INC int8-A: int8 FFN gemms
   const bool calib = getenv("HERO_CALIB") != nullptr; // collect per-channel act stats
   const bool sq = getenv("HERO_SQ") != nullptr;       // apply SmoothQuant (needs HERO_SQ_FILE)
+  const bool cutlass_ffn = getenv("HERO_CUTLASS_FFN") != nullptr;  // fuse mish into up-gemm (CUTLASS)
   float *calib_up=nullptr,*calib_dn=nullptr;          // [L*d],[L*dff] activation abs-max
 
   // ---- weights (device, uploaded once) ----
@@ -467,9 +468,14 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
       for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
         cudaStream_t st=I.streams[e % Impl::NS];
         cudaStreamWaitEvent(st, I.ev_gather, 0);          // each expert waits for the gather
+        if (I.cutlass_ffn) {   // fused mish epilogue in the up-gemm (no separate addBias-mish)
+          cutlassFFNUpMish(I.xs+(size_t)off[e]*d, t.up+(size_t)e*dff*d, I.ffgh+(size_t)off[e]*dff, m, d, dff, st);
+        } else {
+          cublasSetStream(cub, st);
+          gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
+          addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
+        }
         cublasSetStream(cub, st);
-        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)off[e]*d,d,0.f,I.ffgh+(size_t)off[e]*dff,dff);
-        addBiasBatched<half_t>(I.ffgh+(size_t)off[e]*dff,I.ffgh+(size_t)off[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,st);
         gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)off[e]*dff,dff,0.f,I.ys+(size_t)off[e]*d,d); }
       for (int s=0;s<Impl::NS;s++){ cudaEventRecord(I.ev_done[s], I.streams[s]); cudaStreamWaitEvent(0, I.ev_done[s], 0); }
       cublasSetStream(cub, 0);                             // back to default; scatter after all experts
