@@ -37,7 +37,7 @@ namespace NS_BACKEND {
 template <typename ElementType, bool bias>
 void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
                      int batch_size, int num_heads, int depth,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, bool broadcast_bias) {
   ElementType* mha_q = (ElementType*)q;
   ElementType* mha_k = (ElementType*)k;
   ElementType* mha_v = (ElementType*)v;
@@ -91,7 +91,9 @@ void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
 
     p.bias_strideH = 64 * 64;
     p.bias_strideM = 64;
-    p.bias_strideB = num_heads * p.bias_strideH;
+    // broadcast_bias: the same (H,64,64) bias for every batch element (hero's
+    // static geometry bias is batch-independent) -> strideB=0, no N-broadcast.
+    p.bias_strideB = broadcast_bias ? 0 : num_heads * p.bias_strideH;
   }
 
   constexpr auto kernel_fn = attention_kernel_batched_impl<Attention>;
@@ -111,7 +113,8 @@ void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
 
 template <typename DataType>
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
-              int batch_size, int num_heads, int depth, cudaStream_t stream) {
+              int batch_size, int num_heads, int depth, cudaStream_t stream,
+              bool broadcast_bias) {
   if constexpr (std::is_same<DataType, float>::value) {
     throw Exception("Fused MHA is not supported for FP32.");
   }
@@ -120,11 +123,11 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
     if (skip == nullptr) {
       fusedMHACutlass<cutlass::bfloat16_t, false>(
           output, mha_q, mha_k, mha_v, skip, batch_size, num_heads, depth,
-          stream);
+          stream, broadcast_bias);
     } else {
       fusedMHACutlass<cutlass::bfloat16_t, true>(
           output, mha_q, mha_k, mha_v, skip, batch_size, num_heads, depth,
-          stream);
+          stream, broadcast_bias);
     }
   }
 #endif
@@ -132,11 +135,11 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
     if (skip == nullptr) {
       fusedMHACutlass<cutlass::half_t, false>(
           output, mha_q, mha_k, mha_v, skip, batch_size, num_heads, depth,
-          stream);
+          stream, broadcast_bias);
     } else {
       fusedMHACutlass<cutlass::half_t, true>(
           output, mha_q, mha_k, mha_v, skip, batch_size, num_heads, depth,
-          stream);
+          stream, broadcast_bias);
     }
   } else {
     throw Exception("Unsupported data type for Fused MHA.");
@@ -145,18 +148,20 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
 
 template void fusedMHA<half>(void* output, void* mha_q, void* mha_k,
                              void* mha_v, void* skip, int batch_size,
-                             int num_heads, int depth, cudaStream_t stream);
+                             int num_heads, int depth, cudaStream_t stream,
+                             bool broadcast_bias);
 
 #if LC0_CUDA_BF16_SUPPORTED
 template void fusedMHA<__nv_bfloat16>(void* output, void* mha_q, void* mha_k,
                                       void* mha_v, void* skip, int batch_size,
                                       int num_heads, int depth,
-                                      cudaStream_t stream);
+                                      cudaStream_t stream, bool broadcast_bias);
 #endif
 
 template void fusedMHA<float>(void* output, void* mha_q, void* mha_k,
                               void* mha_v, void* skip, int batch_size,
-                              int num_heads, int depth, cudaStream_t stream);
+                              int num_heads, int depth, cudaStream_t stream,
+                              bool broadcast_bias);
 
 }  // namespace cudnn_backend
 }  // namespace lczero
