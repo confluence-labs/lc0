@@ -85,8 +85,8 @@ void BackendBenchmark::Run() {
   options.Add<IntOption>(kThreadsOptionId, 1, 128) = kDefaultThreads;
 
   options.Add<IntOption>(kBatchesId, 1, 999999999) = 100;
-  options.Add<IntOption>(kStartBatchSizeId, 1, 1024) = 1;
-  options.Add<IntOption>(kMaxBatchSizeId, 1, 1024) = 256;
+  options.Add<IntOption>(kStartBatchSizeId, 1, 65536) = 1;
+  options.Add<IntOption>(kMaxBatchSizeId, 1, 65536) = 256;
   options.Add<IntOption>(kBatchStepId, 1, 256) = 1;
   options.Add<BoolOption>(kHeaderOnlyOnceId) = false;
   options.Add<StringOption>(kFenId) = ChessBoard::kStartposFen;
