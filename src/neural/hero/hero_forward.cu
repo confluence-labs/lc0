@@ -133,9 +133,10 @@ struct HeroForward::Impl {
   bool prof = false;         // HERO_PROFILE: split-time the forward's components
   cudaEvent_t pe[6];
   double tqkv=0,tmha=0,tout=0,tffn=0,tln=0; int pcalls=0;
-  // grouped-GEMM FFN (HERO_FFN_GROUPED, default on): all E experts in 2 batched
-  // calls instead of the 13-way multi-stream loop. Host arrays sized to E.
-  bool grouped = true;
+  // grouped-GEMM FFN (HERO_FFN_GROUPED): all E experts in 2 batched calls. A/B'd
+  // 2026-09-18 — cuBLAS grouped is ~6% SLOWER than the multi-stream loop (worse
+  // per-gemm kernels), so default OFF; kept behind the env for reference.
+  bool grouped = false;
   std::vector<int> gM,gRows,gK,gLdA,gLdB,gLdC,gSz;
   std::vector<cublasOperation_t> gTA,gTB;
   std::vector<float> gAlpha,gBeta;
