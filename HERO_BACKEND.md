@@ -267,6 +267,22 @@ tree per position -> warmup idle); real-game (one persistent tree) util is likel
 higher, so confirm with a long single-position `go movetime` before over-claiming.
 THE biggest fresh backend lever found — bigger than any remaining kernel tweak.
 
+**PIPELINED-EVAL REWRITE (commit d805281) — REFUTES the backend-serialization
+hypothesis.** Rewrote HeroForward to a per-Ctx POOL (each Ctx = own cublas +
+streams + buffers; weights shared; everything on per-Ctx streams; HERO_SLOTS-gated,
+default 3) so lc0 search threads OVERLAP evals instead of serializing on the mutex.
+Correct (b4f4 at SLOTS 1 and 3). A/B (threads=4): SLOTS=1 14,160 nps / 67% util;
+SLOTS=3 14,803 nps / 70%; SLOTS=4 14,656 / 68%. Only +4.5% nps, +3 util pts —
+pipelining did NOT fill the 33% idle. CONCLUSION: the GPU idle is NOT backend
+serialization (else 3 concurrent Ctx would fill it) — it's SEARCH-side: the search
+can't generate independent leaves fast enough to saturate the GPU (narrow search;
+connects to BT4-track's cache-diversity flag — hero revisits positions 2.6x).
+So there is NO ~1.4x in the backend engine-fill gap; the backend is MAXED. The
+remaining engine-nps upside is search-algorithm/net-policy (Niranjan's lane), not
+inference. Pipelined eval KEPT (default SLOTS=3): small win + the right
+architecture for multi-GPU concurrency. Note: SLOTS=3 sizes 3x scratch, fine at
+engine minibatch (<=384); use SLOTS=1 for backendbench at huge batch (OOM guard).
+
 CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there). Large batch declines but
 hero STILL runs there at ~8k where BT4 OOMs (zero) — so hero wins at EVERY batch:
 faster at bs512-1024, only-option at bs2048+. Cause of the decline is academic to
