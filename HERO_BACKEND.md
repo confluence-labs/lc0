@@ -297,6 +297,19 @@ fully in real play — no engine-fill gap to recover, MCTS is NOT the bottleneck
 the "MCTS-bound" framing. "Faster" = more/faster GPUs or smaller net; the backend
 is maxed AND fully utilized.
 
+**HAND-WRITTEN KERNEL GATE (2026-09-18, fork): DEAD — cuBLAS is unbeatable on our
+shapes.** Ran the make-or-break microbench (Lambda A100, WMMA vs cuBLAS on hero3's
+exact gemm shapes) before any megakernel effort. cuBLAS MFU: FFN-up 50%, FFN-down
+44%, **qkv 79% (near-peak, ZERO headroom)**; naive hand-WMMA 4-5% (0.05-0.11x).
+The math: a fused FFN must hit >=87% of cuBLAS (glue is only ~13-15% = the whole
+prize); CUTLASS (NVIDIA's own tuned templates) already lands ~78% (<87%), so
+capturing it requires OUT-ENGINEERING cuBLAS — multi-week research-grade, ~3% best
+case, likely negative. NOT WORTH IT. No commits (hero-backend untouched). So the
+LAST speculative backend lever is closed: the ~37% overall MFU is NOT recoverable
+kernel fat (the gemms are near-optimal on cuBLAS; the 37% is inherent small-matrix
+attention + memory-bound glue + MoE imbalance). FINAL: backend is maxed. Real
+speed levers = multi-GPU (done, ~2x) + int8 (parity+half-mem, other track). Done.
+
 CONCLUSION: hero's optimal is ~bs1024 (beats BT4 there). Large batch declines but
 hero STILL runs there at ~8k where BT4 OOMs (zero) — so hero wins at EVERY batch:
 faster at bs512-1024, only-option at bs2048+. Cause of the decline is academic to
