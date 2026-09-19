@@ -39,6 +39,7 @@ int main(int argc,char** argv){
   int L = argc>3?atoi(argv[3]):15;          // layers (depth)
   int E = argc>4?atoi(argv[4]):13;          // experts
   int dff = argc>5?atoi(argv[5]):(d*5)/4;   // FFN width (hero3=1280, hero4=2048); default 1.25d
+  int skew = argc>6?atoi(argv[6]):0;        // 0=uniform route; 1=REAL 13-class dist (54.5% empty)
   int H=d/hd, ed=d/2;                       // heads=d/32, embed_dff=0.5d
   double actM = L*(4.0*d*d + 2.0*(double)d*dff)/1e6;                    // active: attn 4d^2 + 1 expert 2*d*dff
   double totM = actM + L*(double)(E-1)*2.0*d*dff/1e6;                   // + the E-1 inactive experts
@@ -49,7 +50,14 @@ int main(int argc,char** argv){
 
   // deterministic route + host sort -> order[R], offsets[E+1] (uploaded once)
   std::vector<int> route(R), order(R), off(E+1,0), cnt(E,0);
-  for(int r=0;r<R;r++){ route[r]=(r*1103515245u>>8)%E; cnt[route[r]]++; }
+  if(skew){ // REAL measured 13-class shares: empties 54.5%, pawns 11.1%x2, pieces 1.4-3.0%
+    double frac[13]={0.545,0.111,0.028,0.029,0.030,0.014,0.016,0.111,0.028,0.029,0.030,0.014,0.016};
+    int r=0; for(int e=0;e<E&&e<13;e++){ int ce=(int)(frac[e]*R); for(int k=0;k<ce&&r<R;k++) route[r++]=e; }
+    while(r<R) route[r++]=0;                       // remainder -> empty class
+    for(int r2=0;r2<R;r2++) cnt[route[r2]]++;
+  } else {
+    for(int r=0;r<R;r++){ route[r]=(r*1103515245u>>8)%E; cnt[route[r]]++; }
+  }
   for(int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
   std::vector<int> cur(off.begin(),off.end()-1);
   for(int r=0;r<R;r++) order[cur[route[r]]++]=r;
