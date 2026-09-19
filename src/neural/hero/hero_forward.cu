@@ -225,7 +225,7 @@ struct HeroForward::Impl {
   std::mutex mtx;             // lc0 calls ComputeBlocking from multiple search
                              // threads; one GPU -> serialize the forward (leaf
                              // collection still runs parallel on the CPU side)
-  int d, L, H, hd, dff, E, ed, pd;
+  int d, L, H, hd, dff, E, ed, pd, bank;   // bank = H*hd (attention width); may != d (bankdeep)
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
   const bool int8 = getenv("HERO_INT8") != nullptr;   // INC int8-A: int8 FFN gemms
@@ -260,6 +260,7 @@ struct HeroForward::Impl {
   Impl(const HeroWeights& wt, int gpu) : w(wt), device(gpu) {
     CK(cudaSetDevice(device));
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
+    bank=H*hd;   // attention bank width (q/k/v/out + scratch use this, NOT d — bankdeep has bank>>d)
     alpha = powf(2.f*L, -0.25f);
     CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH));
     for (int s=0;s<NS;s++){ cudaStreamCreate(&streams[s]); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
@@ -317,11 +318,11 @@ struct HeroForward::Impl {
                                    qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,
                                    tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
                 cudaFree(dOrder); cudaFree(d_pol); cudaFree(d_wdl); }
-    const size_t T=(size_t)N*64*d, R=(size_t)N*64;
+    const size_t T=(size_t)N*64*d, R=(size_t)N*64, Tbank=(size_t)R*bank;
     auto A=[&](half_t** p,size_t n){ CK(cudaMalloc(p,n*sizeof(half_t))); };
     A(&dPlanes,(size_t)N*112*64); A(&dFlat,(size_t)N*768); A(&pos128,(size_t)N*128);
     A(&pos8192,(size_t)N*8192); A(&cat240,R*240); A(&emb_d,T); A(&e_out,T);
-    A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,T); A(&kd,T); A(&vd,T); A(&po,T);
+    A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,Tbank); A(&kd,Tbank); A(&vd,Tbank); A(&po,Tbank);
     A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
     A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
     A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
@@ -467,13 +468,15 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   dim3 gd(R,((d>>3)+255)/256);   // int4-vectorized gather/scatter (8 halfs/thread)
   for (int li=0; li<I.L; li++){
     auto& t=I.lw[li];
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,d);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,d);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,d);
+    // q/k/v project d -> bank (=H*hd); weights are [bank,d]. bank may be >> d (bankdeep).
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,bank);
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,bank);
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,bank);
     // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
     // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
     fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
-    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,d,1.f,t.ow,d,I.po,d,0.f,I.attn,d);
+    // out projects bank -> d; weight is [d,bank], po is bank-wide.
+    gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,bank,1.f,t.ow,bank,I.po,bank,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
     if (I.calib) k_chan_absmax<<<(d+255)/256,256>>>(I.xa,I.calib_up+(size_t)li*d,R,d);   // up-input stats
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
