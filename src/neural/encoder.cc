@@ -267,6 +267,11 @@ InputPlanes EncodePositionForNN(
       // pawn push, so there can't be any more repeats that are worth
       // considering.
       if (position.GetRule50Ply() == 0) break;
+      // Real history is exhausted once history_idx goes negative (we then just
+      // re-read history[0]); continuing to --history_idx here spins until it
+      // underflows past INT_MIN and wraps to a huge positive index, making the
+      // history[...] access below read out of bounds (segfault). Stop instead.
+      if (history_idx < 0) break;
       // Decrement i so it remains the same as the history_idx decrements.
       --i;
       continue;
