@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "neural/hero/hero_forward.h"
@@ -202,6 +204,33 @@ struct HeroForward::Impl {
   }
 };
 
+// 28-class routing (host) — mirrors chess-dev hero.py routes()/attackers().
+// Deterministic top-1 from the 12 occupancy planes: sliders ray-cast to the
+// first blocker, plus knight/king/pawn lookups. Validated bit-for-bit vs the
+// python routes() on random/dense/edge boards. planes: (N,112,64) fp32 host,
+// channel c square s at planes[n*112*64 + c*64 + s]; ch 0-5 ours PNBRQK, 6-11 theirs.
+static void computeRoute28(const float* planes, int N, int* route){
+  static const int KN[8][2]={{2,1},{2,-1},{-2,1},{-2,-1},{1,2},{1,-2},{-1,2},{-1,-2}};
+  static const int KG[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+  static const int ORTH[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+  static const int DIAG[4][2]={{1,1},{1,-1},{-1,1},{-1,-1}};
+  for(int n=0;n<N;n++){
+    const float* P=planes+(size_t)n*112*64;
+    signed char pc[64];
+    for(int s=0;s<64;s++){ int id=-1; for(int c=0;c<12;c++){ if(P[c*64+s]>0.f){ id=c; break; } } pc[s]=(signed char)id; }
+    for(int s=0;s<64;s++){
+      int r=s>>3, f=s&7, piece = pc[s]>=0 ? pc[s]+1 : 0, attO=0, attT=0;
+      for(int d=0; d<4; d++){ int rr=r,ff=f; for(int k=0;k<7;k++){ rr+=ORTH[d][0]; ff+=ORTH[d][1]; if(rr<0||rr>7||ff<0||ff>7)break; int t=pc[rr*8+ff]; if(t>=0){ if(t==3||t==4)attO=1; else if(t==9||t==10)attT=1; break; } } }
+      for(int d=0; d<4; d++){ int rr=r,ff=f; for(int k=0;k<7;k++){ rr+=DIAG[d][0]; ff+=DIAG[d][1]; if(rr<0||rr>7||ff<0||ff>7)break; int t=pc[rr*8+ff]; if(t>=0){ if(t==2||t==4)attO=1; else if(t==8||t==10)attT=1; break; } } }
+      for(int i=0;i<8;i++){ int rr=r+KN[i][0],ff=f+KN[i][1]; if(rr<0||rr>7||ff<0||ff>7)continue; int t=pc[rr*8+ff]; if(t==1)attO=1; else if(t==7)attT=1; }
+      for(int i=0;i<8;i++){ int rr=r+KG[i][0],ff=f+KG[i][1]; if(rr<0||rr>7||ff<0||ff>7)continue; int t=pc[rr*8+ff]; if(t==5)attO=1; else if(t==11)attT=1; }
+      for(int df=-1;df<=1;df+=2){ int rr=r-1,ff=f+df; if(rr>=0&&ff>=0&&ff<=7&&pc[rr*8+ff]==0)attO=1; }
+      for(int df=-1;df<=1;df+=2){ int rr=r+1,ff=f+df; if(rr<=7&&ff>=0&&ff<=7&&pc[rr*8+ff]==6)attT=1; }
+      route[(size_t)n*64+s] = (piece==0) ? (attO+2*attT) : (4 + (piece-1) + 12*((piece<=6)?attT:attO));
+    }
+  }
+}
+
 // ---------------------------- public entry points ----------------------------
 HeroForward::HeroForward(const HeroWeights& w, int gpu) : p_(new Impl(w, gpu)) {}
 HeroForward::~HeroForward() { delete p_; }
@@ -225,7 +254,18 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   // device routing -> off[] to host (need sizes for the per-expert gemms)
   std::vector<int> off(E+1);
   CK(cudaMemsetAsync(C.dCnt,0,E*sizeof(int),S)); CK(cudaMemsetAsync(C.dCursor,0,E*sizeof(int),S));
-  k_route13<<<N,64,0,S>>>(C.dRoute,C.dPlanes,N);
+  // routing -> dRoute (expert idx per square). 13-class: device argmax over piece
+  // planes. 28-class: host attack-aware route (needs occupancy of the whole board),
+  // uploaded to dRoute. Downstream (hist/offsets/order/gather/FFN/scatter) is E-generic.
+  std::vector<int> hroute;
+  if (E==13) {
+    k_route13<<<N,64,0,S>>>(C.dRoute,C.dPlanes,N);
+  } else if (E==28) {
+    hroute.resize(R); computeRoute28(planes_nchw,N,hroute.data());
+    CK(cudaMemcpyAsync(C.dRoute,hroute.data(),(size_t)R*sizeof(int),cudaMemcpyHostToDevice,S));
+  } else {
+    throw std::runtime_error("hero: no routing rule for classes="+std::to_string(E));
+  }
   k_hist<<<(R+255)/256,256,0,S>>>(C.dCnt,C.dRoute,R);
   k_offsets<<<1,1,0,S>>>(C.dOff,C.dCnt,E);
   k_order<<<(R+255)/256,256,0,S>>>(C.dOrder,C.dCursor,C.dOff,C.dRoute,R);
