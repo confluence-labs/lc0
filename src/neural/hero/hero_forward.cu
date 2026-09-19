@@ -410,7 +410,7 @@ HeroForward::~HeroForward() { delete p_; }
 void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
                       const std::vector<int>& gather, float* policy_out, float* wdl_out) {
   Impl& I=*p_; std::lock_guard<std::mutex> lk(I.mtx); CK(cudaSetDevice(I.device)); I.ensure(N); cublasHandle_t cub=I.cub;
-  const int d=I.d,H=I.H,hd=I.hd,dff=I.dff,E=I.E,ed=I.ed,pd=I.pd; const float al=I.alpha;
+  const int d=I.d,H=I.H,hd=I.hd,dff=I.dff,E=I.E,ed=I.ed,pd=I.pd,bank=I.bank; const float al=I.alpha;
   const size_t T=(size_t)N*64*d; const int R=N*64;
 
   // ---- optional phase profiling (HERO_PROFILE=1): stem/route/trunk/heads ----
