@@ -125,6 +125,18 @@ __global__ void k_toheads(half_t* o,const half_t* in,int H,int hd){
   int n=blockIdx.x,s=blockIdx.y,h=blockIdx.z,e=threadIdx.x; if(e<hd) o[(((size_t)n*H+h)*64+s)*hd+e]=in[((size_t)n*64+s)*(H*hd)+h*hd+e]; }
 __global__ void k_fromheads(half_t* o,const half_t* in,int H,int hd){
   int n=blockIdx.x,s=blockIdx.y,h=blockIdx.z,e=threadIdx.x; if(e<hd) o[((size_t)n*64+s)*(H*hd)+h*hd+e]=in[(((size_t)n*H+h)*64+s)*hd+e]; }
+// softmax over 64 keys + per-(head,query) STATIC bias broadcast over batch — avoids
+// materializing (N,H,64,64) dBias every layer (was ~8GB/fwd write+read for run8d H=128).
+// rows = N*H*64, one block/row, 64 threads; bias is (H,64,64), biasrow = row % (H*64).
+__global__ void k_softmax_bias(half_t* sc,const half_t* bias,int rows,int HB){
+  int r=blockIdx.x; if(r>=rows) return; int j=threadIdx.x;
+  __shared__ float sm[64];
+  float v=__half2float(sc[(size_t)r*64+j]) + __half2float(bias[(size_t)(r%HB)*64+j]);
+  sm[j]=v; __syncthreads();
+  float mx=-1e30f; for(int k=0;k<64;k++) mx=fmaxf(mx,sm[k]);
+  float e=__expf(v-mx); sm[j]=e; __syncthreads();
+  float s=0; for(int k=0;k<64;k++) s+=sm[k];
+  sc[(size_t)r*64+j]=__float2half(e/s); }
 // promotion logits: po[n,f,c] = sum_e kp[n,56+f,e]*PPO[c,e]  (f 0..7, c 0..3)
 __global__ void k_promo(half_t* po,const half_t* kp,const half_t* PPO,int N,int pd){
   int n=blockIdx.x, f=blockIdx.y, c=threadIdx.x; if(c>=4) return;
@@ -254,7 +266,7 @@ struct HeroForward::Impl {
   // ---- scratch (device, sized to capN) ----
   half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
   half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn;
-  half_t *qt=nullptr,*kt=nullptr,*vt=nullptr,*sca=nullptr,*ctx=nullptr,*dBias=nullptr;  // non-fused attn scratch
+  half_t *qt=nullptr,*kt=nullptr,*vt=nullptr,*sca=nullptr,*ctx=nullptr;  // non-fused attn scratch
   // device head scratch
   half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
   float *d_pol,*d_wdl;
@@ -333,9 +345,9 @@ struct HeroForward::Impl {
     A(&pos8192,(size_t)N*8192); A(&cat240,R*240); A(&emb_d,T); A(&e_out,T);
     A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,Tbank); A(&kd,Tbank); A(&vd,Tbank); A(&po,Tbank);
     if (!fused) {  // non-fused attention scratch (per-head layout + scores + broadcast bias)
-      if (capN) { for (half_t* p : {qt,kt,vt,sca,ctx,dBias}) cudaFree(p); }
+      if (capN) { for (half_t* p : {qt,kt,vt,sca,ctx}) cudaFree(p); }
       A(&qt,Tbank); A(&kt,Tbank); A(&vt,Tbank); A(&ctx,Tbank);
-      A(&sca,(size_t)N*H*64*64); A(&dBias,(size_t)N*H*64*64);
+      A(&sca,(size_t)N*H*64*64);   // scores; bias applied in-kernel (no dBias materialization)
     }
     A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
     A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
@@ -493,13 +505,12 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     } else {
       // non-fused path for hd not in {32,64,128} (e.g. run8d hd=5): batched-gemm
       // QK/AV + softmax(+bias). Validated layout (matches stem_gate / pre-fused).
-      const float fac=1.f/sqrtf((float)hd), z0=0.f, o1=1.f; const int HB=H*64*64;
+      const float fac=1.f/sqrtf((float)hd), z0=0.f, o1=1.f;
       k_toheads<<<dim3(N,64,H),hd>>>(I.qt,I.qd,H,hd);
       k_toheads<<<dim3(N,64,H),hd>>>(I.kt,I.kd,H,hd);
       k_toheads<<<dim3(N,64,H),hd>>>(I.vt,I.vd,H,hd);
       CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,hd,&fac,I.kt,CUDA_R_16F,hd,64*hd,I.qt,CUDA_R_16F,hd,64*hd,&z0,I.sca,CUDA_R_16F,64,64*64,N*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
-      { dim3 bg((HB+255)/256,N); k_bcast_bias<<<bg,256>>>(I.dBias,t.bias,HB); }
-      Softmax<half_t>(N*H*64,64,I.sca,I.sca,I.dBias,0);
+      k_softmax_bias<<<N*H*64,64>>>(I.sca,t.bias,N*H*64,H*64);   // +static bias (broadcast) + softmax, no dBias
       CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,hd,64,64,&o1,I.vt,CUDA_R_16F,hd,64*hd,I.sca,CUDA_R_16F,64,64*64,&z0,I.ctx,CUDA_R_16F,hd,64*hd,N*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
       k_fromheads<<<dim3(N,64,H),hd>>>(I.po,I.ctx,H,hd);
     }
