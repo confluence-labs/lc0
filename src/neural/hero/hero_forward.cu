@@ -116,9 +116,15 @@ __global__ void k_gather(half_t* o,const half_t* in,const int* idx,int d){
 __global__ void k_scatter(half_t* o,const half_t* in,const int* idx,int d){
   int r=blockIdx.x, c8=blockIdx.y*blockDim.x+threadIdx.x, d8=d>>3;
   if(c8<d8) ((int4*)o)[(size_t)idx[r]*d8+c8]=((const int4*)in)[(size_t)r*d8+c8]; }
-// broadcast per-head bias (H,64,64) -> (N,H,64,64) for fusedMHA (batch-independent)
+// broadcast per-head bias (H,64,64) -> (N,H,64,64) for the bias input (batch-independent)
 __global__ void k_bcast_bias(half_t* o,const half_t* b,int HB){  // HB = H*64*64
   int n=blockIdx.y, x=blockIdx.x*blockDim.x+threadIdx.x; if(x<HB) o[(size_t)n*HB+x]=b[x]; }
+// (N,64,H*hd) interleaved <-> (N,H,64,hd) per-head layout, for the non-fused
+// attention path (hd not in {32,64,128} -> fusedMHA can't take it; e.g. run8d hd=5)
+__global__ void k_toheads(half_t* o,const half_t* in,int H,int hd){
+  int n=blockIdx.x,s=blockIdx.y,h=blockIdx.z,e=threadIdx.x; if(e<hd) o[(((size_t)n*H+h)*64+s)*hd+e]=in[((size_t)n*64+s)*(H*hd)+h*hd+e]; }
+__global__ void k_fromheads(half_t* o,const half_t* in,int H,int hd){
+  int n=blockIdx.x,s=blockIdx.y,h=blockIdx.z,e=threadIdx.x; if(e<hd) o[((size_t)n*64+s)*(H*hd)+h*hd+e]=in[(((size_t)n*H+h)*64+s)*hd+e]; }
 // promotion logits: po[n,f,c] = sum_e kp[n,56+f,e]*PPO[c,e]  (f 0..7, c 0..3)
 __global__ void k_promo(half_t* po,const half_t* kp,const half_t* PPO,int N,int pd){
   int n=blockIdx.x, f=blockIdx.y, c=threadIdx.x; if(c>=4) return;
@@ -226,6 +232,7 @@ struct HeroForward::Impl {
                              // threads; one GPU -> serialize the forward (leaf
                              // collection still runs parallel on the CPU side)
   int d, L, H, hd, dff, E, ed, pd, bank;   // bank = H*hd (attention width); may != d (bankdeep)
+  bool fused;                              // fusedMHA supports hd in {32,64,128}; else non-fused path (run8d hd=5)
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
   const bool int8 = getenv("HERO_INT8") != nullptr;   // INC int8-A: int8 FFN gemms
@@ -247,6 +254,7 @@ struct HeroForward::Impl {
   // ---- scratch (device, sized to capN) ----
   half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
   half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn;
+  half_t *qt=nullptr,*kt=nullptr,*vt=nullptr,*sca=nullptr,*ctx=nullptr,*dBias=nullptr;  // non-fused attn scratch
   // device head scratch
   half_t *tp,*qp,*kp,*scp,*promo,*tv,*qv,*kv,*vvh,*scv,*vout;
   float *d_pol,*d_wdl;
@@ -261,6 +269,7 @@ struct HeroForward::Impl {
     CK(cudaSetDevice(device));
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
     bank=H*hd;   // attention bank width (q/k/v/out + scratch use this, NOT d — bankdeep has bank>>d)
+    fused = (hd==32||hd==64||hd==128);   // else CUTLASS fmha misaligns; use the batched-gemm path
     alpha = powf(2.f*L, -0.25f);
     CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH));
     for (int s=0;s<NS;s++){ cudaStreamCreate(&streams[s]); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
@@ -323,6 +332,11 @@ struct HeroForward::Impl {
     A(&dPlanes,(size_t)N*112*64); A(&dFlat,(size_t)N*768); A(&pos128,(size_t)N*128);
     A(&pos8192,(size_t)N*8192); A(&cat240,R*240); A(&emb_d,T); A(&e_out,T);
     A(&up_h,R*ed); A(&dn_h,T); A(&x,T); A(&qd,Tbank); A(&kd,Tbank); A(&vd,Tbank); A(&po,Tbank);
+    if (!fused) {  // non-fused attention scratch (per-head layout + scores + broadcast bias)
+      if (capN) { for (half_t* p : {qt,kt,vt,sca,ctx,dBias}) cudaFree(p); }
+      A(&qt,Tbank); A(&kt,Tbank); A(&vt,Tbank); A(&ctx,Tbank);
+      A(&sca,(size_t)N*H*64*64); A(&dBias,(size_t)N*H*64*64);
+    }
     A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
     A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
     A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
@@ -472,9 +486,23 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,bank);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,bank);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,bank);
-    // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
-    // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
-    fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
+    if (I.fused) {
+      // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
+      // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
+      fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
+    } else {
+      // non-fused path for hd not in {32,64,128} (e.g. run8d hd=5): batched-gemm
+      // QK/AV + softmax(+bias). Validated layout (matches stem_gate / pre-fused).
+      const float fac=1.f/sqrtf((float)hd), z0=0.f, o1=1.f; const int HB=H*64*64;
+      k_toheads<<<dim3(N,64,H),hd>>>(I.qt,I.qd,H,hd);
+      k_toheads<<<dim3(N,64,H),hd>>>(I.kt,I.kd,H,hd);
+      k_toheads<<<dim3(N,64,H),hd>>>(I.vt,I.vd,H,hd);
+      CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,hd,&fac,I.kt,CUDA_R_16F,hd,64*hd,I.qt,CUDA_R_16F,hd,64*hd,&z0,I.sca,CUDA_R_16F,64,64*64,N*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+      { dim3 bg((HB+255)/256,N); k_bcast_bias<<<bg,256>>>(I.dBias,t.bias,HB); }
+      Softmax<half_t>(N*H*64,64,I.sca,I.sca,I.dBias,0);
+      CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_N,CUBLAS_OP_N,hd,64,64,&o1,I.vt,CUDA_R_16F,hd,64*hd,I.sca,CUDA_R_16F,64,64*64,&z0,I.ctx,CUDA_R_16F,hd,64*hd,N*H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+      k_fromheads<<<dim3(N,64,H),hd>>>(I.po,I.ctx,H,hd);
+    }
     // out projects bank -> d; weight is [d,bank], po is bank-wide.
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,bank,1.f,t.ow,bank,I.po,bank,0.f,I.attn,d);
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
