@@ -2,6 +2,7 @@
 // HeroWeights (uploads all weights to GPU); Run() does one batched forward.
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 namespace lczero {
@@ -20,8 +21,12 @@ class HeroForward {
   // (square-major first-12 planes for the positional preproc). gather: the fixed
   // 1858-entry attention-policy move map (cat4288 -> 1858). Writes policy_out
   // [N*1858] and wdl_out [N*3] (logits; caller applies softmax as lc0 expects).
+  // lc0bench 0009: masks/vals are the PACKED InputPlanes (one 64-bit mask + one
+  // float per plane, N*112 of each). When they are given, planes_nchw/flat12 may
+  // be null and the expansion happens on device. 28-class route only.
   void Run(const float* planes_nchw, const float* flat12, int N,
-           const std::vector<int>& gather, float* policy_out, float* wdl_out);
+           const std::vector<int>& gather, float* policy_out, float* wdl_out,
+           const uint64_t* masks = nullptr, const float* vals = nullptr);
 
   // test-only: run the device route kernels on planes_nchw and return the per-square
   // expert ids [N*64] (for bit-exact validation vs the oracle route). 28-class path.

@@ -619,6 +619,12 @@ if get_option('build_backends')
         output : outputname,
         command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
       )
+      # lc0bench 0008: the fused q|k|v + band program (hero_qkv_band.cu).
+      cuda_files += custom_target('hero qkv band',
+        input : 'src/neural/hero/hero_qkv_band.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+      )
       cuda_files += 'src/neural/hero/network_hero.cc'
     endif
 
