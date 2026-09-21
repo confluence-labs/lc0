@@ -114,6 +114,8 @@ HeroWeights LoadHeroWeights(const std::string& path) {
       {"policy.ppo.weight", &w.pol_ppo_w},   {"value.embed.weight", &w.val_embed_w},
       {"value.q.weight", &w.val_q_w},        {"value.k.weight", &w.val_k_w},
       {"value.v.weight", &w.val_v_w},
+      {"value.embed.bias", &w.val_embed_b},  // lc0bench: optional, see patch 0002
+      {"value.q.bias", &w.val_q_b},          {"value.k.bias", &w.val_k_b},
   };
 
   auto layer_dst = [&](const std::string& name) -> Vec* {

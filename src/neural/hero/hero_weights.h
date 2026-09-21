@@ -41,6 +41,9 @@ struct HeroWeights {
   Vec pol_ppo_w;                  // [4, pol_d]
   Vec val_embed_w;                // [pol_d, d]
   Vec val_q_w, val_k_w;           // [pol_d, pol_d]
+  // lc0bench: optional value-head biases (the played head has none; the value_q
+  // aux head does). Empty => the forward passes nullptr, exactly as before.
+  Vec val_embed_b, val_q_b, val_k_b;
   Vec val_v_w;                    // [3, pol_d]
 };
 

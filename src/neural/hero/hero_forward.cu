@@ -37,6 +37,36 @@ using half_t = half;
 namespace lczero {
 namespace hero {
 
+// lc0bench 0007: the fused residual-add + LayerNorm (hero_ln.cu). Same
+// arithmetic as common_kernels' LayerNorm with bias/beta zero and act NONE:
+// out = gamma * (input*alpha + skip - mean) / sqrt(var + eps), stats in fp32.
+void heroAddLN(half* o, const half* x, const half* skip, const half* gam,
+               int N, int C, float eps, float alpha, cudaStream_t stream);
+bool heroAddLNSupported(int C);
+
+// lc0bench 0006: the grouped expert FFN (hero_gffn.cu). Rows are class-SORTED and
+// the row tile's class comes from a device-side tile->class map; mish is fused in
+// the up epilogue and the scatter through dOrder is the down epilogue.
+bool heroGFFNSupported(int d, int dff);
+int  heroGFFNPad(int dff);
+int  heroGFFNTileRows();
+int  heroGFFNPadRows();
+void heroGFFNMap(const int* cnt, int* offs, int* cur, int* tmap, int E, int ntmax,
+                 cudaStream_t stream);
+void heroGFFNUp(half* h, const half* xs, const half* upw, const int* tmap,
+                const int* offs, const int* row, int R, int dp, int d, int ntiles,
+                cudaStream_t stream);
+void heroGFFNDown(half* out, const half* h, const half* dnw, const int* tmap,
+                  const int* offs, const int* row, int R, int d, int dff, int ldh,
+                  int ntiles, cudaStream_t stream);
+void heroGFFNCompare(const half* a, const half* b, int n, float* scratch, float* host2);
+
+// lc0bench 0005: the hand-written band (hero_band.cu). Same contract as
+// fusedMHA: q/k/v/o are [N*64, H*hd] fp16 row-major with head-major columns,
+// bias is [H,64,64] fp16 broadcast over the batch, scale 1/sqrt(hd).
+void heroBand(half* o, const half* q, const half* k, const half* v,
+              const half* bias, int N, int H, int hd, cudaStream_t stream);
+
 static void gemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,
                  int m, int n, int k, float a, const half_t* A, int lda,
                  const half_t* B, int ldb, float b, half_t* C, int ldc) {
@@ -245,8 +275,17 @@ struct HeroForward::Impl {
                              // collection still runs parallel on the CPU side)
   int d, L, H, hd, dff, E, ed, pd, bank;   // bank = H*hd (attention width); may != d (bankdeep)
   bool fused;                              // fusedMHA supports hd in {32,64,128}; else non-fused path (run8d hd=5)
+  bool fastln;                             // lc0bench 0007: hero_ln.cu instead of LayerNorm<half_t>
+  bool band;                               // lc0bench 0005: hero_band.cu instead of fusedMHA
   float alpha;
   int capN = 0;                // batch the scratch is sized for (grows on demand)
+  // lc0bench 0006: the grouped expert FFN. dp is the up-GEMM's padded column count
+  // (== dff whenever dff is already a multiple of 128, which costs hero3 nothing).
+  bool gffn = false; int dp = 0;
+  int *dOffs=nullptr, *dTmap=nullptr;   // [E+1] class row offsets; [2*ntmax] tile->class
+  const bool gffn_check = getenv("HERO_GFFN_CHECK") != nullptr;
+  const bool no_agat = getenv("HERO_NO_AGAT") != nullptr;   // A/B the A-load gather alone
+  half_t *ffnref=nullptr; float *cmpd=nullptr;   // HERO_GFFN_CHECK only
   const bool int8 = getenv("HERO_INT8") != nullptr;   // INC int8-A: int8 FFN gemms
   const bool calib = getenv("HERO_CALIB") != nullptr; // collect per-channel act stats
   const bool sq = getenv("HERO_SQ") != nullptr;       // apply SmoothQuant (needs HERO_SQ_FILE)
@@ -256,15 +295,18 @@ struct HeroForward::Impl {
   // ---- weights (device, uploaded once) ----
   half_t *pp0,*pp1,*emb,*eln,*eu,*edn,*efln,*zbuf;
   struct LW { half_t *qw,*kw,*vw,*ow,*l1g,*l2g,*up,*dn,*bias;   // bias: (H,64,64) fp16
+              half_t *upp=nullptr;                              // lc0bench 0006: [E,dp,d] up weights
               int8_t *up_i8=nullptr,*dn_i8=nullptr; float *up_inv=nullptr,*dn_inv=nullptr;
               float *sq_up_inv=nullptr,*sq_dn_inv=nullptr; };   // SmoothQuant 1/s prescales
   std::vector<LW> lw;
   // head weights (device, uploaded once) + policy-promotion + gather map
   half_t *h_pe,*h_peb,*h_pq,*h_pqb,*h_pk,*h_pkb,*h_ve,*h_vq,*h_vk,*h_vv,*h_ppo;
+  half_t *h_veb=nullptr,*h_vqb=nullptr,*h_vkb=nullptr;   // lc0bench: optional value biases
   int* dGather=nullptr;        // 1858 policy move indices (uploaded on first Run)
 
   // ---- scratch (device, sized to capN) ----
   half_t *dPlanes,*dFlat,*pos128,*pos8192,*cat240,*emb_d,*e_out,*up_h,*dn_h,*x;
+  float *stgP=nullptr,*stgF=nullptr;   // mfu60: fp32 H2D staging, sized in ensure()
   half_t *qd,*kd,*vd,*po,*attn,*xa,*xs,*ffgh,*ys,*ffn;
   half_t *qt=nullptr,*kt=nullptr,*vt=nullptr,*sca=nullptr,*ctx=nullptr;  // non-fused attn scratch
   // device head scratch
@@ -282,7 +324,16 @@ struct HeroForward::Impl {
     d=w.d; L=w.layers; H=w.heads; hd=w.hd; dff=w.dff; E=w.classes; ed=w.embed_dff; pd=w.pol_d;
     bank=H*hd;   // attention bank width (q/k/v/out + scratch use this, NOT d — bankdeep has bank>>d)
     fused = (hd==32||hd==64||hd==128);   // else CUTLASS fmha misaligns; use the batched-gemm path
+    // lc0bench 0007: shape-generic (d % 16 == 0, d <= 2048). HERO_NO_FASTLN=1 = A/B.
+    fastln = heroAddLNSupported(d) && getenv("HERO_NO_FASTLN")==nullptr;
+    // lc0bench 0005: deep-bank nets only (heroD4: bank 4096 != d 640), so hero3
+    // (square, bank == d) stays on fusedMHA and bit-identical. HERO_NO_BAND=1 = A/B.
+    band = (hd==32 && getenv("HERO_NO_BAND")==nullptr);   // square banks too (hero3)
     alpha = powf(2.f*L, -0.25f);
+    // lc0bench 0006: shape-generic; steps aside for int8 / CUTLASS-FFN / calibration.
+    gffn = heroGFFNSupported(d,dff) && !int8 && !cutlass_ffn && !calib && E>1
+           && getenv("HERO_NO_GFFN")==nullptr;
+    dp = gffn ? heroGFFNPad(dff) : dff;
     CB(cublasCreate(&cub)); CB(cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH));
     for (int s=0;s<NS;s++){ cudaStreamCreate(&streams[s]); cudaEventCreateWithFlags(&ev_done[s],cudaEventDisableTiming); }
     cudaEventCreateWithFlags(&ev_gather,cudaEventDisableTiming);
@@ -316,7 +367,13 @@ struct HeroForward::Impl {
           quant_chan(s.ffn_down.data(), (size_t)E*d,   dff, &t.dn_i8, &t.dn_inv);
         }
         t.up=t.dn=nullptr;
-      } else { t.up=up_f(s.ffn_up); t.dn=up_f(s.ffn_down); }
+      } else { t.up=up_f(s.ffn_up); t.dn=up_f(s.ffn_down);
+        if (gffn && dp!=dff) {   // lc0bench 0006: [E,dp,d], pad columns zero -> mish(0)=0
+          std::vector<float> pad((size_t)E*dp*d, 0.f);
+          for (int e=0;e<E;e++) for (size_t i=0;i<(size_t)dff*d;i++)
+            pad[(size_t)e*dp*d+i] = s.ffn_up[(size_t)e*dff*d+i];
+          t.upp=up_f(pad);
+        } else t.upp=t.up; }
       std::vector<float> bias_hhh((size_t)H*64*64, 0.f);   // free + alpha_mix . geo (once)
       for (int h=0;h<H;h++) for (int i=0;i<64;i++) for (int j=0;j<64;j++){
         double b=s.free[(size_t)h*64*64+i*64+j];
@@ -329,6 +386,9 @@ struct HeroForward::Impl {
     h_pe=up_f(w.pol_embed_w); h_peb=up_f(w.pol_embed_b);
     h_pq=up_f(w.pol_q_w); h_pqb=up_f(w.pol_q_b); h_pk=up_f(w.pol_k_w); h_pkb=up_f(w.pol_k_b);
     h_ve=up_f(w.val_embed_w); h_vq=up_f(w.val_q_w); h_vk=up_f(w.val_k_w); h_vv=up_f(w.val_v_w);
+    if (!w.val_embed_b.empty()) h_veb=up_f(w.val_embed_b);
+    if (!w.val_q_b.empty())     h_vqb=up_f(w.val_q_b);
+    if (!w.val_k_b.empty())     h_vkb=up_f(w.val_k_b);
     h_ppo=up_f(w.pol_ppo_w);
     ensure(512);   // preallocate for the useful minibatch range (no mid-search realloc)
   }
@@ -338,7 +398,7 @@ struct HeroForward::Impl {
     if (capN) { for (half_t* p : {dPlanes,dFlat,pos128,pos8192,cat240,emb_d,e_out,up_h,dn_h,x,
                                    qd,kd,vd,po,attn,xa,xs,ffgh,ys,ffn,
                                    tp,qp,kp,scp,promo,tv,qv,kv,vvh,scv,vout}) cudaFree(p);
-                cudaFree(dOrder); cudaFree(d_pol); cudaFree(d_wdl); }
+                cudaFree(dOrder); cudaFree(d_pol); cudaFree(d_wdl); if (dTmap) cudaFree(dTmap); }
     const size_t T=(size_t)N*64*d, R=(size_t)N*64, Tbank=(size_t)R*bank;
     auto A=[&](half_t** p,size_t n){ CK(cudaMalloc(p,n*sizeof(half_t))); };
     A(&dPlanes,(size_t)N*112*64); A(&dFlat,(size_t)N*768); A(&pos128,(size_t)N*128);
@@ -349,16 +409,28 @@ struct HeroForward::Impl {
       A(&qt,Tbank); A(&kt,Tbank); A(&vt,Tbank); A(&ctx,Tbank);
       A(&sca,(size_t)N*H*64*64);   // scores; bias applied in-kernel (no dBias materialization)
     }
-    A(&attn,T); A(&xa,T); A(&xs,T); A(&ffgh,R*dff); A(&ys,T); A(&ffn,T);
+    // lc0bench 0006: a partial class tile reads up to BM-1 rows past its class (its
+    // stores are masked), so both grouped A buffers carry spare rows; ffgh is dp wide.
+    const size_t gpad = gffn ? (size_t)heroGFFNPadRows() : 0;
+    A(&attn,T); A(&xa,T); A(&xs,T+gpad*d); A(&ffgh,(R+gpad)*(size_t)dp); A(&ys,T); A(&ffn,T);
+    if (gffn) { CK(cudaMemset(xs+T,0,gpad*d*sizeof(half_t)));
+               CK(cudaMemset(ffgh+R*(size_t)dp,0,gpad*(size_t)dp*sizeof(half_t))); }
+    if (gffn_check) { if (capN) { cudaFree(ffnref); } A(&ffnref,T); }
     A(&tp,R*(size_t)pd); A(&qp,R*(size_t)pd); A(&kp,R*(size_t)pd); A(&scp,(size_t)N*4096);
     A(&promo,(size_t)N*8*4); A(&tv,R*(size_t)pd); A(&qv,R*(size_t)pd); A(&kv,R*(size_t)pd);
     A(&vvh,R*3); A(&scv,(size_t)N*4096); A(&vout,R*3);
+    if (capN) { cudaFree(stgP); cudaFree(stgF); }
+    CK(cudaMalloc(&stgP,(size_t)N*112*64*sizeof(float)));
+    CK(cudaMalloc(&stgF,(size_t)N*768*sizeof(float)));
     CK(cudaMalloc(&dOrder,R*sizeof(int)));
+    if (gffn) CK(cudaMalloc(&dTmap,2*((size_t)R/heroGFFNTileRows()+E+1)*sizeof(int)));   // lc0bench 0006
     CK(cudaMalloc(&d_pol,(size_t)N*1858*sizeof(float))); CK(cudaMalloc(&d_wdl,(size_t)N*3*sizeof(float)));
     if (capN) { cudaFree(dOcc);cudaFree(dPiece);cudaFree(dAtt_o);cudaFree(dAtt_t);cudaFree(dRoute); }
     CK(cudaMalloc(&dOcc,R)); CK(cudaMalloc(&dPiece,R)); CK(cudaMalloc(&dAtt_o,R)); CK(cudaMalloc(&dAtt_t,R));
     CK(cudaMalloc(&dRoute,R*sizeof(int)));
-    if (!capN) { CK(cudaMalloc(&dCnt,(E+1)*sizeof(int))); CK(cudaMalloc(&dCur,E*sizeof(int))); }
+    if (!capN) { CK(cudaMalloc(&dCnt,(E+1)*sizeof(int))); CK(cudaMalloc(&dCur,E*sizeof(int)));
+      if (gffn) CK(cudaMalloc(&dOffs,(E+1)*sizeof(int)));                      // lc0bench 0006
+      if (gffn_check) CK(cudaMalloc(&cmpd,2*sizeof(float))); }
     if (int8) { if(capN){ cudaFree(xs_i8);cudaFree(gh_i8);cudaFree(ffgh_i32);cudaFree(ys_i32);cudaFree(xrow_inv);cudaFree(ghrow_inv); }
       CK(cudaMalloc(&xs_i8,R*(size_t)d)); CK(cudaMalloc(&gh_i8,R*(size_t)dff));
       CK(cudaMalloc(&ffgh_i32,R*(size_t)dff*sizeof(int32_t))); CK(cudaMalloc(&ys_i32,R*(size_t)d*sizeof(int32_t)));
@@ -441,19 +513,20 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
 
   // ---- optional phase profiling (HERO_PROFILE=1): stem/route/trunk/heads ----
   static const bool prof = getenv("HERO_PROFILE") != nullptr;
-  static cudaEvent_t E0=0,Es=0,Er=0,Et=0,Eh=0;
-  static double a_stem=0,a_route=0,a_trunk=0,a_heads=0; static long prof_calls=0;
-  if (prof && !E0){ cudaEventCreate(&E0);cudaEventCreate(&Es);cudaEventCreate(&Er);cudaEventCreate(&Et);cudaEventCreate(&Eh); }
+  static cudaEvent_t E0=0,Es=0,Er=0,Et=0,Eh=0,Eu=0;   // Eu: mfu60 upload split
+  static double a_stem=0,a_route=0,a_trunk=0,a_heads=0,a_up=0; static long prof_calls=0;
+  if (prof && !E0){ cudaEventCreate(&E0);cudaEventCreate(&Es);cudaEventCreate(&Er);cudaEventCreate(&Et);cudaEventCreate(&Eh);cudaEventCreate(&Eu); }
   if (prof) cudaEventRecord(E0,0);
 
-  { // upload planes (fp32 -> fp16) via copyTypeConverted
-    float* tmp; CK(cudaMalloc(&tmp,(size_t)N*112*64*sizeof(float)));
-    CK(cudaMemcpy(tmp,planes_nchw,(size_t)N*112*64*sizeof(float),cudaMemcpyHostToDevice));
-    copyTypeConverted(I.dPlanes,tmp,(int)((size_t)N*112*64),0); CK(cudaFree(tmp));
-    CK(cudaMalloc(&tmp,(size_t)N*768*sizeof(float)));
-    CK(cudaMemcpy(tmp,flat12,(size_t)N*768*sizeof(float),cudaMemcpyHostToDevice));
-    copyTypeConverted(I.dFlat,tmp,(int)((size_t)N*768),0); CK(cudaFree(tmp));
+  { // upload planes (fp32 -> fp16) via copyTypeConverted. mfu60: the staging buffers
+    // are allocated ONCE in ensure(); the old per-call cudaMalloc/cudaFree pair cost
+    // ~10 ms of a 77 ms forward at mb 384 (cudaFree synchronizes the device).
+    CK(cudaMemcpy(I.stgP,planes_nchw,(size_t)N*112*64*sizeof(float),cudaMemcpyHostToDevice));
+    copyTypeConverted(I.dPlanes,I.stgP,(int)((size_t)N*112*64),0);
+    CK(cudaMemcpy(I.stgF,flat12,(size_t)N*768*sizeof(float),cudaMemcpyHostToDevice));
+    copyTypeConverted(I.dFlat,I.stgF,(int)((size_t)N*768),0);
   }
+  if (prof) cudaEventRecord(Eu,0);   // upload done (mfu60)
 
   // ---- stem ----
   gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,128,N,768,1.f,I.pp0,768,I.dFlat,768,0.f,I.pos128,128);
@@ -483,9 +556,13 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     k_route_id<<<dim3(N,1),64>>>(I.dPiece,I.dAtt_o,I.dAtt_t,I.dRoute,N);
     CK(cudaMemset(I.dCnt,0,(E+1)*sizeof(int)));
     k_hist<<<(R+255)/256,256>>>(I.dRoute,I.dCnt,R);
+    if (I.gffn) {   // lc0bench 0006: offsets, the scatter cursor and the tile->class map,
+      heroGFFNMap(I.dCnt, I.dOffs, I.dCur, I.dTmap, E, R/heroGFFNTileRows()+E, 0);
+    } else {        // all on device. The D2H below BLOCKS: route's one sync with the host
     std::vector<int> cnt(E); CK(cudaMemcpy(cnt.data(),I.dCnt,E*sizeof(int),cudaMemcpyDeviceToHost));
     for (int e=0;e<E;e++) off[e+1]=off[e]+cnt[e];
     CK(cudaMemcpy(I.dCur,off.data(),E*sizeof(int),cudaMemcpyHostToDevice));   // cur = start offsets
+    }
     k_scatter_order<<<(R+255)/256,256>>>(I.dRoute,I.dCur,I.dOrder,R);
   }
   if (prof) cudaEventRecord(Er,0);   // route done
@@ -498,7 +575,9 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.qw,d,I.x,d,0.f,I.qd,bank);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.kw,d,I.x,d,0.f,I.kd,bank);
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,bank,R,d,1.f,t.vw,d,I.x,d,0.f,I.vd,bank);
-    if (I.fused) {
+    if (I.band) {
+      heroBand(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0);   // lc0bench 0005
+    } else if (I.fused) {
       // broadcast the static (H,64,64) bias to all N (strideB=0) — no per-layer
       // N-broadcast write (was ~8GB/fwd at bs2048; the large-batch killer).
       fusedMHA<half_t>(I.po, I.qd, I.kd, I.vd, t.bias, N, H, hd, 0, true);
@@ -516,8 +595,11 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
     }
     // out projects bank -> d; weight is [d,bank], po is bank-wide.
     gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,R,bank,1.f,t.ow,bank,I.po,bank,0.f,I.attn,d);
+    if (I.fastln) heroAddLN(I.xa,I.attn,I.x,t.l1g,R,d,1e-3f,al,0);   // lc0bench 0007
+    else
     LayerNorm<half_t>(R,d,I.xa,I.attn,I.zbuf,I.x,t.l1g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);
     if (I.calib) k_chan_absmax<<<(d+255)/256,256>>>(I.xa,I.calib_up+(size_t)li*d,R,d);   // up-input stats
+    if (!I.gffn || I.no_agat)   // lc0bench 0006: the grouped up-GEMM gathers in its own A-load
     k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);
     if (I.int8) {   // int8 experts on NS streams — quant/dequant of one expert overlaps the
                     // int8 gemm of another (the v1 fix: v1 was serial, so overhead wasn't hidden)
@@ -535,6 +617,12 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
       cublasSetStream(cub, 0);
     } else {   // fp16 experts run CONCURRENTLY across NS streams (independent) — key for hero5 scaling
       cudaEventRecord(I.ev_gather, 0);
+      if (I.gffn) {   // lc0bench 0006: two grouped GEMMs, mish and the scatter fused
+        const int nt_ = R/heroGFFNTileRows()+E;
+        heroGFFNUp(I.ffgh, I.no_agat ? I.xs : I.xa, t.upp, I.dTmap, I.dOffs,
+                   I.no_agat ? nullptr : I.dOrder, R, I.dp, d, nt_, 0);
+        heroGFFNDown(I.ffn, I.ffgh, t.dn, I.dTmap, I.dOffs, I.dOrder, R, d, dff, I.dp, nt_, 0);
+      } else
       for (int e=0;e<E;e++){ int m=off[e+1]-off[e]; if(!m) continue;
         cudaStream_t st=I.streams[e % Impl::NS];
         cudaStreamWaitEvent(st, I.ev_gather, 0);          // each expert waits for the gather
@@ -551,7 +639,23 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
       cublasSetStream(cub, 0);                             // back to default; scatter after all experts
     }
     if (I.calib) k_chan_absmax<<<(dff+255)/256,256>>>(I.ffgh,I.calib_dn+(size_t)li*dff,R,dff);   // down-input stats
+    if (!I.gffn)   // lc0bench 0006: the grouped down-GEMM already stored through dOrder
     k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
+    if (I.gffn && I.gffn_check && li==0) {   // run the loop path too and score the gap
+      std::vector<int> o2(E+1); CK(cudaMemcpy(o2.data(),I.dOffs,(E+1)*sizeof(int),cudaMemcpyDeviceToHost));
+      k_gather<<<gd,256>>>(I.xs,I.xa,I.dOrder,d);   // the loop path needs the staged copy
+      CK(cudaMemcpy(I.ffnref,I.ffn,(size_t)R*d*sizeof(half_t),cudaMemcpyDeviceToDevice));
+      for (int e=0;e<E;e++){ int m=o2[e+1]-o2[e]; if(!m) continue;
+        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,dff,m,d,1.f,t.up+(size_t)e*dff*d,d,I.xs+(size_t)o2[e]*d,d,0.f,I.ffgh+(size_t)o2[e]*dff,dff);
+        addBiasBatched<half_t>(I.ffgh+(size_t)o2[e]*dff,I.ffgh+(size_t)o2[e]*dff,I.zbuf,1,m,dff,ACTIVATION_MISH,0);
+        gemm(cub,CUBLAS_OP_T,CUBLAS_OP_N,d,m,dff,1.f,t.dn+(size_t)e*d*dff,dff,I.ffgh+(size_t)o2[e]*dff,dff,0.f,I.ys+(size_t)o2[e]*d,d); }
+      k_scatter<<<gd,256>>>(I.ffn,I.ys,I.dOrder,d);
+      float h2[2]={0,0}; heroGFFNCompare(I.ffnref,I.ffn,R*d,I.cmpd,h2);
+      fprintf(stderr,"HEROGFFN layer0 grouped-vs-loop: max|d| %.5f  max rel %.5f  (n=%d)\n",h2[0],h2[1],R*d);
+      CK(cudaMemcpy(I.ffn,I.ffnref,(size_t)R*d*sizeof(half_t),cudaMemcpyDeviceToDevice));
+    }
+    if (I.fastln) heroAddLN(I.x,I.ffn,I.xa,t.l2g,R,d,1e-3f,al,0);    // lc0bench 0007
+    else
     LayerNorm<half_t>(R,d,I.x,I.ffn,I.zbuf,I.xa,t.l2g,I.zbuf,1e-3f,al,ACTIVATION_NONE,0);  // x = next input
   }
   if (prof) cudaEventRecord(Et,0);   // trunk done
@@ -568,9 +672,9 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   { dim3 pg(N,8); k_promo<<<pg,4>>>(I.promo,I.kp,I.h_ppo,N,pd); }
   { dim3 gg(N,(1858+255)/256); k_pol_gather<<<gg,256>>>(I.d_pol,I.scp,I.promo,I.dGather,N); }
   // value: tv = mish(val_embed(x)); qv,kv,vv; softmax(qv.kv^T*sc) then .vv, mean over queries
-  I.head_gemm(I.h_ve,d,pd,nullptr,true,I.x,R,I.tv);
-  I.head_gemm(I.h_vq,pd,pd,nullptr,false,I.tv,R,I.qv);
-  I.head_gemm(I.h_vk,pd,pd,nullptr,false,I.tv,R,I.kv);
+  I.head_gemm(I.h_ve,d,pd,I.h_veb,true,I.x,R,I.tv);
+  I.head_gemm(I.h_vq,pd,pd,I.h_vqb,false,I.tv,R,I.qv);
+  I.head_gemm(I.h_vk,pd,pd,I.h_vkb,false,I.tv,R,I.kv);
   I.head_gemm(I.h_vv,pd,3,nullptr,false,I.tv,R,I.vvh);
   CB(cublasGemmStridedBatchedEx(cub,CUBLAS_OP_T,CUBLAS_OP_N,64,64,pd,&sc,I.kv,CUDA_R_16F,pd,64*pd,I.qv,CUDA_R_16F,pd,64*pd,&z,I.scv,CUDA_R_16F,64,64*64,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
   Softmax<half_t>(N*64,64,I.scv,I.scv,(half_t*)nullptr,0);
@@ -580,10 +684,12 @@ void HeroForward::Run(const float* planes_nchw, const float* flat12, int N,
   if (prof) cudaEventRecord(Eh,0);   // heads done
   CK(cudaDeviceSynchronize());
   if (prof) { float ms; long c=++prof_calls;
-    cudaEventElapsedTime(&ms,E0,Es); a_stem+=ms;  cudaEventElapsedTime(&ms,Es,Er); a_route+=ms;
+    cudaEventElapsedTime(&ms,E0,Eu); a_up+=ms;
+    cudaEventElapsedTime(&ms,Eu,Es); a_stem+=ms;  cudaEventElapsedTime(&ms,Es,Er); a_route+=ms;
     cudaEventElapsedTime(&ms,Er,Et); a_trunk+=ms; cudaEventElapsedTime(&ms,Et,Eh); a_heads+=ms;
     if (c%50==0) fprintf(stderr,"HEROPROF N=%d/50-avg: stem %.2f | route %.2f | trunk %.2f | heads %.2f ms (sum %.1f)\n",
-      N, a_stem/c, a_route/c, a_trunk/c, a_heads/c, (a_stem+a_route+a_trunk+a_heads)/c); }
+      N, a_stem/c, a_route/c, a_trunk/c, a_heads/c, (a_up+a_stem+a_route+a_trunk+a_heads)/c);
+    if (c%50==0) fprintf(stderr,"HEROUP N=%d/%ld-avg: upload %.2f ms\n", N, c, a_up/c); }
   CK(cudaMemcpy(policy_out,I.d_pol,(size_t)N*1858*sizeof(float),cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(wdl_out,I.d_wdl,(size_t)N*3*sizeof(float),cudaMemcpyDeviceToHost));
 }

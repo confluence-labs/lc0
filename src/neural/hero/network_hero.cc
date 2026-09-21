@@ -45,7 +45,7 @@ class HeroNetwork : public Network {
   HeroNetwork(const std::string& path, int gpu)
       : weights_(hero::LoadHeroWeights(path)), forward_(weights_, gpu) {
     capabilities_.input_format =
-        pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION_V2;
+        pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE;  // lc0bench patch 0001
     capabilities_.output_format = pblczero::NetworkFormat::OUTPUT_WDL;
     capabilities_.moves_left = pblczero::NetworkFormat::MOVES_LEFT_NONE;
     // invert lc0's 4288->1858 scatter map into the 1858-entry gather we need

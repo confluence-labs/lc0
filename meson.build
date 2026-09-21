@@ -601,6 +601,24 @@ if get_option('build_backends')
         output : outputname,
         command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
       )
+      # lc0bench 0007: the fused add+LayerNorm (hero_ln.cu).
+      cuda_files += custom_target('hero ln',
+        input : 'src/neural/hero/hero_ln.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+      )
+      # lc0bench 0006: the grouped expert FFN (hero_gffn.cu).
+      cuda_files += custom_target('hero gffn',
+        input : 'src/neural/hero/hero_gffn.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+      )
+      # lc0bench 0005: the hand-written deep-bank attention band (hero_band.cu).
+      cuda_files += custom_target('hero band',
+        input : 'src/neural/hero/hero_band.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+      )
       cuda_files += 'src/neural/hero/network_hero.cc'
     endif
 
